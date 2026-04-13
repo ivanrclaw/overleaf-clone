@@ -14,8 +14,8 @@ RUN npm ci
 COPY server/ ./
 RUN npm run build
 
-# Production image
-FROM node:20-bookworm-slim
+# Production image (use full bookworm for TeX Live + native modules)
+FROM node:20-bookworm
 
 # Install TeX Live (pdflatex for compilation) + chktex for linting
 RUN apt-get update && apt-get install -y --no-install-recommends \
