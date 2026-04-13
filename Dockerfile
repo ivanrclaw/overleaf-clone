@@ -14,10 +14,10 @@ RUN npm ci
 COPY server/ ./
 RUN npm run build
 
-# Production image
-FROM node:20-bookworm-slim
+# Production image — use bookworm (not slim) for glibc 2.36 compatibility
+FROM node:20-bookworm
 
-# Install chktex + tectonic runtime dependencies
+# Install chktex + tectonic via official installer + runtime deps
 RUN apt-get update && apt-get install -y \
     chktex \
     ca-certificates \
@@ -29,9 +29,8 @@ RUN apt-get update && apt-get install -y \
     libpng16-16 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tectonic 0.16.8 from GitHub release
-RUN curl -L https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.8/tectonic-0.16.8-x86_64-unknown-linux-gnu.tar.gz \
-    | tar xz -C /usr/local/bin/ \
+# Install tectonic via official installer script
+RUN curl -fsSL https://drop-sh.fullyjustified.net | sh \
     && tectonic --version
 
 WORKDIR /app
