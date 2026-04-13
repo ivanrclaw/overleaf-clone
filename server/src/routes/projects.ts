@@ -196,10 +196,15 @@ export function createProjectRouter(upload: multer.Multer): Router {
       return;
     }
 
+    // Normalize path: remove trailing slash (except for root '/')
+    let normalizedPath = filePath.endsWith('/') && filePath.length > 1
+      ? filePath.slice(0, -1)
+      : filePath;
+
     // Check for duplicate path
     const existing = db
       .prepare('SELECT id FROM project_files WHERE project_id = ? AND path = ?')
-      .get(req.params.id, filePath);
+      .get(req.params.id, normalizedPath);
     if (existing) {
       res.status(409).json({ error: 'A file or folder at this path already exists' });
       return;
@@ -209,12 +214,12 @@ export function createProjectRouter(upload: multer.Multer): Router {
     const fileContent = isFolder ? '' : (content || '');
 
     // Auto-create parent folders
-    ensureParentFolders(Number(req.params.id), filePath);
+    ensureParentFolders(Number(req.params.id), normalizedPath);
 
     const insert = db.prepare(
       'INSERT INTO project_files (project_id, name, path, is_folder, content) VALUES (?, ?, ?, ?, ?)'
     );
-    const result = insert.run(req.params.id, name.trim(), filePath, isFolder, fileContent);
+    const result = insert.run(req.params.id, name.trim(), normalizedPath, isFolder, fileContent);
 
     const file = db.prepare('SELECT id, name, path, is_folder, created_at, updated_at FROM project_files WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ file });
