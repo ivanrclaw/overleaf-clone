@@ -35,6 +35,9 @@ COPY --from=builder /app/server/dist ./dist
 COPY --from=builder /app/server/package.json ./
 COPY --from=builder /app/server/node_modules ./node_modules
 
+# Rebuild native modules (better-sqlite3) for this exact Node version
+RUN npm rebuild better-sqlite3 2>/dev/null || npm rebuild
+
 # Copy client build
 COPY --from=builder /app/client/dist ./client/dist
 
