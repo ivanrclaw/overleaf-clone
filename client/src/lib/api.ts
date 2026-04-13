@@ -41,7 +41,6 @@ async function uploadFilesRequest(projectId: number, files: File[], folder: stri
     method: 'POST',
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     body: formData,
-    // NOTE: do NOT set Content-Type — browser sets it with boundary for multipart
   });
 
   if (res.status === 401) {
@@ -57,6 +56,40 @@ async function uploadFilesRequest(projectId: number, files: File[], folder: stri
   }
 
   return res.json();
+}
+
+export interface ProjectMember {
+  role: string;
+  created_at: string;
+  user_id: number;
+  email: string;
+  display_name: string | null;
+}
+
+export interface ShareLink {
+  id: number;
+  token: string;
+  role: string;
+  expires_at: string | null;
+  created_at: string;
+  created_by_email: string;
+}
+
+export interface InviteInfo {
+  projectName: string;
+  ownerEmail: string;
+  ownerName: string | null;
+  role: string;
+  projectId: number;
+}
+
+export interface SharedProject {
+  id: number;
+  name: string;
+  content?: string;
+  created_at: string;
+  updated_at: string;
+  member_role: string;
 }
 
 export const api = {
@@ -81,7 +114,7 @@ export const api = {
         body: JSON.stringify({ name }),
       }),
     get: (id: number) =>
-      request<{ project: { id: number; name: string; content: string; created_at: string; updated_at: string } }>(`/projects/${id}`),
+      request<{ project: { id: number; name: string; content: string; created_at: string; updated_at: string }; role: string }>(`/projects/${id}`),
     save: (id: number, content: string) =>
       request<{ project: { id: number; name: string; content: string; created_at: string; updated_at: string } }>(`/projects/${id}`, {
         method: 'PUT',
@@ -101,7 +134,7 @@ export const api = {
       }),
     // File operations
     listFiles: (id: number) =>
-      request<{ files: { id: number; name: string; path: string; is_folder: boolean; created_at: string; updated_at: string }[] }>(`/projects/${id}/files`),
+      request<{ files: { id: number; name: string; path: string; is_folder: boolean; created_at: string; updated_at: string }[]; role: string }>(`/projects/${id}/files`),
     createFile: (projectId: number, name: string, path: string, isFolder?: boolean, content?: string) =>
       request<{ file: { id: number; name: string; path: string; is_folder: boolean; content: string } }>(`/projects/${projectId}/files`, {
         method: 'POST',
@@ -123,5 +156,43 @@ export const api = {
       request<{ ok: boolean }>(`/projects/${projectId}/files/${fileId}`, { method: 'DELETE' }),
     uploadFiles: (projectId: number, files: File[], folder: string = '/') =>
       uploadFilesRequest(projectId, files, folder),
+  },
+  share: {
+    // Get project members and share links
+    getMembers: (projectId: number) =>
+      request<{ members: ProjectMember[]; shareLinks: ShareLink[]; currentUserRole: string }>(`/share/project/${projectId}/members`),
+    // Generate a share link
+    createLink: (projectId: number, role: 'viewer' | 'editor' = 'viewer', expiresInHours?: number) =>
+      request<{ shareLink: ShareLink & { project_id: number } }>(`/share/project/${projectId}/link`, {
+        method: 'POST',
+        body: JSON.stringify({ role, expiresInHours }),
+      }),
+    // Revoke a share link
+    revokeLink: (linkId: number) =>
+      request<{ ok: boolean }>(`/share/link/${linkId}`, { method: 'DELETE' }),
+    // Get invite info (public, no auth needed but we send token if available)
+    getInviteInfo: (token: string) => {
+      const authToken = getToken();
+      const headers: Record<string, string> = {};
+      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+      return request<InviteInfo>(`/share/invite/${token}`, { headers });
+    },
+    // Accept a share invite
+    acceptInvite: (token: string) =>
+      request<{ project: any; role: string; alreadyMember: boolean }>(`/share/invite/${token}/accept`, {
+        method: 'POST',
+      }),
+    // Update member role
+    updateMemberRole: (projectId: number, userId: number, role: 'viewer' | 'editor') =>
+      request<{ ok: boolean; role: string }>(`/share/project/${projectId}/members/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role }),
+      }),
+    // Remove member
+    removeMember: (projectId: number, userId: number) =>
+      request<{ ok: boolean }>(`/share/project/${projectId}/members/${userId}`, { method: 'DELETE' }),
+    // List shared projects
+    listShared: () =>
+      request<{ projects: SharedProject[] }>('/share/projects'),
   },
 };

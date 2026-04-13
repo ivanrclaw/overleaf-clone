@@ -6,13 +6,14 @@ interface FileExplorerProps {
   files: ProjectFile[];
   activeFileId: number | null;
   onFileSelect: (file: ProjectFile) => void;
-  onFileCreate: (name: string, path: string, isFolder: boolean) => void;
-  onFileDelete: (file: ProjectFile) => void;
-  onFileUpload: () => void;
-  onFileMove: (fileId: number, newPath: string) => void;
-  onFileUploadToFolder: (folder: string, files: FileList) => void;
+  onFileCreate?: (name: string, path: string, isFolder: boolean) => void;
+  onFileDelete?: (file: ProjectFile) => void;
+  onFileUpload?: () => void;
+  onFileMove?: (fileId: number, newPath: string) => void;
+  onFileUploadToFolder?: (folder: string, files: FileList) => void;
   onFileRename?: (file: ProjectFile, newName: string) => void;
   loading: boolean;
+  readOnly?: boolean;
 }
 
 interface TreeNode {
@@ -74,7 +75,7 @@ function buildTree(files: ProjectFile[]): TreeNode[] {
   return sortNodes(root);
 }
 
-export default function FileExplorer({ files, activeFileId, onFileSelect, onFileCreate, onFileDelete, onFileUpload, onFileMove, onFileUploadToFolder, loading }: FileExplorerProps) {
+export default function FileExplorer({ files, activeFileId, onFileSelect, onFileCreate, onFileDelete, onFileUpload, onFileMove, onFileUploadToFolder, loading, readOnly }: FileExplorerProps) {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['/']));
   const [showNewFile, setShowNewFile] = useState<{ type: 'file' | 'folder'; parentPath: string } | null>(null);
   const [newItemName, setNewItemName] = useState('');
@@ -96,7 +97,7 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
     if (!showNewFile || !newItemName.trim()) return;
     const parentPath = showNewFile.parentPath === '/' ? '' : showNewFile.parentPath;
     const fullPath = parentPath + '/' + newItemName.trim();
-    onFileCreate(newItemName.trim(), fullPath, showNewFile.type === 'folder');
+    onFileCreate?.(newItemName.trim(), fullPath, showNewFile.type === 'folder');
     setShowNewFile(null);
     setNewItemName('');
   };
@@ -161,7 +162,7 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
       const internalCheck = e.dataTransfer.getData('text/plain');
       if (!internalCheck.startsWith('internal:')) {
         // External file(s) dropped — upload to target folder
-        onFileUploadToFolder(targetFolderPath === '/' ? '/' : targetFolderPath, e.dataTransfer.files);
+        onFileUploadToFolder?.(targetFolderPath === '/' ? '/' : targetFolderPath, e.dataTransfer.files);
         return;
       }
     }
@@ -180,7 +181,7 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
       // Don't move into self (folder into itself)
       if (is_folder && (newPath === sourcePath || newPath.startsWith(sourcePath + '/'))) return;
 
-      onFileMove(id, newPath);
+      onFileMove?.(id, newPath);
 
       // Auto-expand the target folder
       setExpandedFolders(prev => {
@@ -241,16 +242,17 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
               {isExpanded ? <FolderOpen className="h-4 w-4 flex-shrink-0 text-amber-500" /> : <Folder className="h-4 w-4 flex-shrink-0 text-amber-500" />}
               <span className="truncate">{node.name}</span>
             </button>
-            {/* Add file/folder inside this folder */}
-            <div className="flex items-center opacity-0 group-hover:opacity-100" style={{ opacity: isDropTarget ? 1 : undefined }}>
-              <button
-                onClick={(e) => { e.stopPropagation(); setShowNewFile({ type: 'file', parentPath: node.path }); setNewItemName(''); }}
-                className="p-0.5 text-gray-400 hover:text-brand-500 dark:hover:text-brand-400"
-                title="New file in folder"
-              >
-                <FilePlus className="h-3 w-3" />
-              </button>
-            </div>
+            {!readOnly && (
+              <div className="flex items-center opacity-0 group-hover:opacity-100" style={{ opacity: isDropTarget ? 1 : undefined }}>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowNewFile({ type: 'file', parentPath: node.path }); setNewItemName(''); }}
+                  className="p-0.5 text-gray-400 hover:text-brand-500 dark:hover:text-brand-400"
+                  title="New file in folder"
+                >
+                  <FilePlus className="h-3 w-3" />
+                </button>
+              </div>
+            )}
           </div>
           {isExpanded && (
             <>
@@ -283,12 +285,14 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
           )}
           <span className="truncate">{node.name}</span>
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); node.file && onFileDelete(node.file); }}
-          className="flex-shrink-0 text-gray-400 opacity-0 hover:text-red-500 group-hover:opacity-100 dark:text-gray-500 dark:hover:text-red-400"
-        >
-          <Trash2 className="h-3 w-3" />
-        </button>
+        {!readOnly && (
+          <button
+            onClick={(e) => { e.stopPropagation(); node.file && onFileDelete?.(node.file); }}
+            className="flex-shrink-0 text-gray-400 opacity-0 hover:text-red-500 group-hover:opacity-100 dark:text-gray-500 dark:hover:text-red-400"
+          >
+            <Trash2 className="h-3 w-3" />
+          </button>
+        )}
       </div>
     );
   };
@@ -297,29 +301,31 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
     <div className="flex h-full flex-col border-r border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-950">
       <div className="flex items-center justify-between border-b border-gray-200 px-3 py-2 dark:border-gray-800">
         <span className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Files</span>
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => { setShowNewFile({ type: 'file', parentPath: '/' }); setNewItemName(''); }}
-            className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
-            title="New file"
-          >
-            <FilePlus className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={() => { setShowNewFile({ type: 'folder', parentPath: '/' }); setNewItemName(''); }}
-            className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
-            title="New folder"
-          >
-            <FolderPlus className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={onFileUpload}
-            className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
-            title="Upload file"
-          >
-            <Upload className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        {!readOnly && (
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => { setShowNewFile({ type: 'file', parentPath: '/' }); setNewItemName(''); }}
+              className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+              title="New file"
+            >
+              <FilePlus className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={() => { setShowNewFile({ type: 'folder', parentPath: '/' }); setNewItemName(''); }}
+              className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+              title="New folder"
+            >
+              <FolderPlus className="h-3.5 w-3.5" />
+            </button>
+            <button
+              onClick={onFileUpload}
+              className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+              title="Upload file"
+            >
+              <Upload className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
       </div>
       <div
         className={`flex-1 overflow-y-auto p-1 transition-colors ${

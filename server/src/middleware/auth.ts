@@ -26,3 +26,20 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+
+// Optional auth: sets user if token present, but doesn't require it
+export function optionalAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7);
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as { id: number; email: string };
+      (req as RequestWithUser).user = { id: decoded.id, email: decoded.email };
+    } catch {
+      // Invalid token — proceed without user
+    }
+  }
+  next();
+}
+
+export { JWT_SECRET };

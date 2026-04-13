@@ -1,6 +1,7 @@
 export interface User {
   id: number;
   email: string;
+  display_name?: string | null;
 }
 
 export interface Project {
@@ -32,4 +33,40 @@ export interface LintDiagnostic {
 export interface AuthResponse {
   token: string;
   user: User;
+}
+
+export interface ProjectMember {
+  role: string;
+  created_at: string;
+  user_id: number;
+  email: string;
+  display_name: string | null;
+}
+
+export interface ShareLink {
+  id: number;
+  token: string;
+  project_id: number;
+  role: string;
+  expires_at: string | null;
+  created_at: string;
+  created_by: number;
+  created_by_email?: string;
+}
+
+export interface InviteInfo {
+  projectName: string;
+  ownerEmail: string;
+  ownerName: string | null;
+  role: string;
+  projectId: number;
+}
+
+export interface CollaboratorInfo {
+  userId: number;
+  email: string;
+  displayName: string | null;
+  role: string;
+  cursor?: { line: number; col: number };
+  selection?: { fromLine: number; fromCol: number; toLine: number; toCol: number };
 }

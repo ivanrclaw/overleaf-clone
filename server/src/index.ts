@@ -5,9 +5,13 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import http from 'http';
+import { WebSocketServer } from 'ws';
 import multer from 'multer';
 import authRoutes from './routes/auth';
 import { createProjectRouter } from './routes/projects';
+import shareRoutes from './routes/share';
+import { setupWebSocket } from './websocket';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -25,13 +29,21 @@ app.use(express.json({ limit: '10mb' }));
 // API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', createProjectRouter(upload));
+app.use('/api/share', shareRoutes);
+
+// Create HTTP server for WebSocket support
+const server = http.createServer(app);
+
+// WebSocket server — attached to the same HTTP server
+const wss = new WebSocketServer({ server, path: '/ws' });
+setupWebSocket(wss);
 
 // Serve static files from client/dist in production
 const clientDistPath = path.join(__dirname, '../client/dist');
 if (fs.existsSync(clientDistPath)) {
   app.use(express.static(clientDistPath));
 
-  // SPA fallback: any non-API route serves index.html
+  // SPA fallback: any non-API, non-WS route serves index.html
   app.get('*', (req, res) => {
     if (!req.path.startsWith('/api/')) {
       res.sendFile(path.join(clientDistPath, 'index.html'));
@@ -46,6 +58,7 @@ if (fs.existsSync(clientDistPath)) {
   });
 }
 
-app.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`TexFlow server running on http://0.0.0.0:${PORT}`);
+  console.log(`WebSocket available at ws://0.0.0.0:${PORT}/ws`);
 });

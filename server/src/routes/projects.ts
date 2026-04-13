@@ -32,21 +32,37 @@ function getUser(req: Request): { id: number; email: string } {
   return (req as unknown as RequestWithUser).user;
 }
 
-// Helper: verify project belongs to user, return project or null
+// Helper: verify project belongs to user OR user is a project member
 function getProjectForUser(projectId: number | string, userId: number): any {
   return db
     .prepare('SELECT * FROM projects WHERE id = ? AND user_id = ?')
     .get(projectId, userId);
 }
 
+// Helper: get project if user has any membership (owner or shared member)
+function getProjectWithMembership(projectId: number | string, userId: number): { project: any; role: string } | null {
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+  if (!project) return null;
+
+  const membership = db.prepare(
+    'SELECT role FROM project_members WHERE project_id = ? AND user_id = ?'
+  ).get(projectId, userId) as { role: string } | undefined;
+
+  if (!membership) return null;
+
+  return { project, role: membership.role };
+}
+
+// Helper: check if user has write access to project
+function canEdit(role: string): boolean {
+  return role === 'owner' || role === 'editor';
+}
+
 // Helper: ensure parent folders exist for a given path
 function ensureParentFolders(projectId: number, filePath: string): void {
   const parts = filePath.split('/').filter(Boolean);
-  // Build up folder paths; e.g. for "/chapters/intro.tex" → ["/chapters"]
-  // For "/figures/img.png" → ["/figures"]
   for (let i = 1; i < parts.length; i++) {
     const folderPath = '/' + parts.slice(0, i).join('/');
-    // Try to insert; if it already exists the UNIQUE constraint will skip
     try {
       db.prepare(
         'INSERT INTO project_files (project_id, name, path, is_folder, content) VALUES (?, ?, ?, 1, ?)'
@@ -66,7 +82,7 @@ export function createProjectRouter(upload: multer.Multer): Router {
 
   // ─── Project CRUD ─────────────────────────────────────────────
 
-  // GET /api/projects
+  // GET /api/projects — list user's own projects
   router.get('/', (req, res: Response): void => {
     const user = getUser(req);
     const projects = db
@@ -91,10 +107,12 @@ export function createProjectRouter(upload: multer.Multer): Router {
 
     // Create root folder entry and main.tex in project_files
     const insertFile = db.prepare('INSERT INTO project_files (project_id, name, path, is_folder, content) VALUES (?, ?, ?, ?, ?)');
+    const insertMember = db.prepare('INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?)');
 
     const transaction = db.transaction(() => {
       insertFile.run(projectId, '/', '/', 1, '');
       insertFile.run(projectId, 'main.tex', '/main.tex', 0, DEFAULT_LATEX_TEMPLATE);
+      insertMember.run(projectId, user.id, 'owner');
     });
     transaction();
 
@@ -102,69 +120,74 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.status(201).json({ project });
   });
 
-  // GET /api/projects/:id
+  // GET /api/projects/:id — get project (accessible by members)
   router.get('/:id', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
+    const access = getProjectWithMembership(req.params.id, user.id);
 
-    if (!project) {
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    res.json({ project });
+    res.json({ project: access.project, role: access.role });
   });
 
-  // PUT /api/projects/:id  (save)
+  // PUT /api/projects/:id  (save) — requires edit access
   router.put('/:id', (req, res: Response): void => {
     const user = getUser(req);
-    const { content, name } = req.body;
+    const access = getProjectWithMembership(req.params.id, user.id);
 
-    const existing = getProjectForUser(req.params.id, user.id);
-    if (!existing) {
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    // Build update dynamically based on what was sent
-    if (content !== undefined && content !== null) {
-      db.prepare('UPDATE projects SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(content, req.params.id, user.id);
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access to this project' });
+      return;
+    }
 
-      // Also update main.tex in project_files for backward compat
+    const { content, name } = req.body;
+
+    if (content !== undefined && content !== null) {
+      db.prepare('UPDATE projects SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(content, req.params.id);
+
       db.prepare('UPDATE project_files SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND path = ?')
         .run(content, req.params.id, '/main.tex');
     }
 
     if (name !== undefined && name !== null) {
-      db.prepare('UPDATE projects SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
-        .run(name, req.params.id, user.id);
+      db.prepare('UPDATE projects SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(name, req.params.id);
     }
 
     const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
     res.json({ project });
   });
 
-  // DELETE /api/projects/:id
+  // DELETE /api/projects/:id — only owner can delete
   router.delete('/:id', (req, res: Response): void => {
     const user = getUser(req);
-    const result = db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').run(req.params.id, user.id);
+    const project = getProjectForUser(req.params.id, user.id);
 
-    if (result.changes === 0) {
+    if (!project) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
+    db.prepare('DELETE FROM projects WHERE id = ? AND user_id = ?').run(req.params.id, user.id);
     res.json({ ok: true });
   });
 
   // ─── File Routes ──────────────────────────────────────────────
 
-  // GET /api/projects/:id/files — list all files
+  // GET /api/projects/:id/files — list all files (accessible by members)
   router.get('/:id/files', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
@@ -173,15 +196,19 @@ export function createProjectRouter(upload: multer.Multer): Router {
       .prepare('SELECT id, name, path, is_folder, created_at, updated_at FROM project_files WHERE project_id = ? ORDER BY path')
       .all(req.params.id);
 
-    res.json({ files });
+    res.json({ files, role: access.role });
   });
 
-  // POST /api/projects/:id/files — create file or folder
+  // POST /api/projects/:id/files — create file or folder (requires edit)
   router.post('/:id/files', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access' });
       return;
     }
 
@@ -196,12 +223,10 @@ export function createProjectRouter(upload: multer.Multer): Router {
       return;
     }
 
-    // Normalize path: remove trailing slash (except for root '/')
     let normalizedPath = filePath.endsWith('/') && filePath.length > 1
       ? filePath.slice(0, -1)
       : filePath;
 
-    // Check for duplicate path
     const existing = db
       .prepare('SELECT id FROM project_files WHERE project_id = ? AND path = ?')
       .get(req.params.id, normalizedPath);
@@ -213,7 +238,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
     const isFolder = is_folder ? 1 : 0;
     const fileContent = isFolder ? '' : (content || '');
 
-    // Auto-create parent folders
     ensureParentFolders(Number(req.params.id), normalizedPath);
 
     const insert = db.prepare(
@@ -225,11 +249,11 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.status(201).json({ file });
   });
 
-  // GET /api/projects/:id/files/:fileId — get file content
+  // GET /api/projects/:id/files/:fileId — get file content (accessible by members)
   router.get('/:id/files/:fileId', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
@@ -246,12 +270,16 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.json({ file });
   });
 
-  // PUT /api/projects/:id/files/:fileId — update file (auto-save uses this)
+  // PUT /api/projects/:id/files/:fileId — update file (requires edit)
   router.put('/:id/files/:fileId', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access' });
       return;
     }
 
@@ -274,7 +302,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
         .run(name, req.params.fileId);
     }
 
-    // If neither content nor name provided, just update timestamp (e.g. touch)
     if (content === undefined && name === undefined) {
       db.prepare('UPDATE project_files SET updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(req.params.fileId);
@@ -284,12 +311,16 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.json({ file: updated });
   });
 
-  // PATCH /api/projects/:id/files/:fileId/move — move/rename a file
+  // PATCH /api/projects/:id/files/:fileId/move — move/rename (requires edit)
   router.patch('/:id/files/:fileId/move', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access' });
       return;
     }
 
@@ -307,12 +338,10 @@ export function createProjectRouter(upload: multer.Multer): Router {
       return;
     }
 
-    // Normalize
     let normalizedNewPath = newPath.endsWith('/') && newPath.length > 1
       ? newPath.slice(0, -1)
       : newPath;
 
-    // Check for duplicate at destination
     const existing = db
       .prepare('SELECT id FROM project_files WHERE project_id = ? AND path = ? AND id != ?')
       .get(req.params.id, normalizedNewPath, req.params.fileId);
@@ -324,22 +353,18 @@ export function createProjectRouter(upload: multer.Multer): Router {
     const oldPath = file.path as string;
     const newName = normalizedNewPath.split('/').pop() || file.name;
 
-    // Ensure parent folders at destination exist
     ensureParentFolders(Number(req.params.id), normalizedNewPath);
 
     if (file.is_folder) {
-      // Move the folder and all children (path prefix)
       const folderPrefix = oldPath + '/';
       const children = db
         .prepare('SELECT id, path FROM project_files WHERE project_id = ? AND path LIKE ?')
         .all(req.params.id, folderPrefix + '%') as any[];
 
       const transaction = db.transaction(() => {
-        // Move the folder itself
         db.prepare('UPDATE project_files SET name = ?, path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
           .run(newName, normalizedNewPath, file.id);
 
-        // Move all children: replace old prefix with new prefix
         for (const child of children) {
           const childNewPath = normalizedNewPath + child.path.substring(oldPath.length);
           const childNewName = childNewPath.split('/').pop()!;
@@ -349,7 +374,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
       });
       transaction();
     } else {
-      // Just move the file
       db.prepare('UPDATE project_files SET name = ?, path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
         .run(newName, normalizedNewPath, file.id);
     }
@@ -358,12 +382,16 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.json({ file: updated });
   });
 
-  // DELETE /api/projects/:id/files/:fileId — delete file or folder
+  // DELETE /api/projects/:id/files/:fileId — delete file (requires edit)
   router.delete('/:id/files/:fileId', (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access' });
       return;
     }
 
@@ -375,10 +403,8 @@ export function createProjectRouter(upload: multer.Multer): Router {
       return;
     }
 
-    // Delete the file itself
     db.prepare('DELETE FROM project_files WHERE id = ?').run(req.params.fileId);
 
-    // If it's a folder, also delete all files with paths starting with folder path + /
     if (file.is_folder) {
       const folderPath = file.path.endsWith('/') ? file.path : file.path + '/';
       db.prepare('DELETE FROM project_files WHERE project_id = ? AND path LIKE ?')
@@ -388,12 +414,16 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.json({ ok: true });
   });
 
-  // POST /api/projects/:id/files/upload — upload files (multipart/form-data)
+  // POST /api/projects/:id/files/upload — upload files (requires edit)
   router.post('/:id/files/upload', upload.array('files', 20), (req, res: Response): void => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    if (!canEdit(access.role)) {
+      res.status(403).json({ error: 'You do not have edit access' });
       return;
     }
 
@@ -414,21 +444,17 @@ export function createProjectRouter(upload: multer.Multer): Router {
       for (const file of files) {
         const filePath = folder.endsWith('/') ? folder + file.originalname : folder + '/' + file.originalname;
 
-        // Check if file already exists at this path
         const existing = db
           .prepare('SELECT id FROM project_files WHERE project_id = ? AND path = ?')
           .get(req.params.id, filePath);
 
         if (existing) {
-          // Update existing file content
           const content = file.buffer.toString('base64');
           db.prepare('UPDATE project_files SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND path = ?')
             .run(content, req.params.id, filePath);
         } else {
-          // Ensure parent folders exist
           ensureParentFolders(Number(req.params.id), filePath);
 
-          // Determine if we should store as base64 (binary files) or as text
           const isBinary = isBinaryFile(file.originalname, file.mimetype);
           const content = isBinary ? file.buffer.toString('base64') : file.buffer.toString('utf-8');
 
@@ -437,7 +463,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
             const newFile = db.prepare('SELECT id, name, path, is_folder, created_at, updated_at FROM project_files WHERE id = ?').get(result.lastInsertRowid);
             uploadedFiles.push(newFile);
           } catch (err: any) {
-            // If unique constraint violation (race condition), try update instead
             if (err.message && err.message.includes('UNIQUE constraint')) {
               const content = isBinary ? file.buffer.toString('base64') : file.buffer.toString('utf-8');
               db.prepare('UPDATE project_files SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE project_id = ? AND path = ?')
@@ -460,52 +485,42 @@ export function createProjectRouter(upload: multer.Multer): Router {
 
   // ─── Compile ──────────────────────────────────────────────────
 
-  // POST /api/projects/:id/compile
+  // POST /api/projects/:id/compile (accessible by members)
   router.post('/:id/compile', async (req, res: Response): Promise<void> => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    // Draft mode: skip images, use simplified rendering
     const draft = req.body.draft === true || req.query.draft === '1';
 
-    // Get all files for the project
     const files = db
       .prepare('SELECT path, content, is_folder FROM project_files WHERE project_id = ?')
       .all(req.params.id) as any[];
 
     if (files.length === 0) {
-      // Fallback: use project.content for backward compat
-      files.push({ path: '/main.tex', content: project.content, is_folder: 0 });
+      res.status(400).json({ error: 'No files in project' });
+      return;
     }
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-compile-'));
 
     try {
-      // Write all non-folder files to temp dir preserving folder structure
       for (const file of files) {
         if (file.is_folder) continue;
 
-        // Strip leading slash for filesystem path
         const relPath = file.path.startsWith('/') ? file.path.substring(1) : file.path;
         const absPath = path.join(tmpDir, relPath);
-
-        // Ensure parent directory exists
         const dir = path.dirname(absPath);
         fs.mkdirSync(dir, { recursive: true });
 
-        // Determine if content is base64 encoded (binary) or text
         if (isBinaryPath(file.path)) {
-          // Write binary content from base64
           fs.writeFileSync(absPath, Buffer.from(file.content, 'base64'));
         } else {
-          // In draft mode, modify .tex files to use draft options
           if (draft && (file.path.endsWith('.tex') || file.path === '/main.tex')) {
             let texContent = file.content;
-            // Add draft option to \documentclass if not already present
             texContent = texContent.replace(
               /\\documentclass(\[([^\]]*)\])?/g,
               (match: string, _bracket: string | undefined, options: string | undefined) => {
@@ -521,7 +536,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
         }
       }
 
-      // Find main.tex file
       const mainFile = files.find((f: any) => f.path === '/main.tex' && !f.is_folder);
       if (!mainFile) {
         res.status(400).json({ error: 'No main.tex file found in project' });
@@ -530,7 +544,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
 
       const texFile = path.join(tmpDir, 'main.tex');
 
-      // Try pdflatex first (TeX Live), fall back to tectonic
       let compileCmd: string;
       let compileArgs: string[];
       try {
@@ -538,13 +551,11 @@ export function createProjectRouter(upload: multer.Multer): Router {
         compileCmd = 'pdflatex';
         compileArgs = ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
         if (draft) {
-          // pdflatex draft mode: don't fail on missing images
           compileArgs = ['-draftmode', '-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
         }
       } catch {
         compileCmd = 'tectonic';
         compileArgs = [texFile];
-        // Tectonic doesn't have a separate draft mode, but the documentclass draft option handles it
       }
 
       const { stderr } = await execFileAsync(compileCmd, compileArgs, {
@@ -576,29 +587,27 @@ export function createProjectRouter(upload: multer.Multer): Router {
 
   // ─── Lint ─────────────────────────────────────────────────────
 
-  // POST /api/projects/:id/lint
+  // POST /api/projects/:id/lint (accessible by members)
   router.post('/:id/lint', async (req, res: Response): Promise<void> => {
     const user = getUser(req);
-    const project = getProjectForUser(req.params.id, user.id);
-    if (!project) {
+    const access = getProjectWithMembership(req.params.id, user.id);
+    if (!access) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
 
-    // Accept content from request body (for real-time linting of unsaved changes)
     const overrideContent = req.body.content;
     const overrideFileId = req.body.fileId;
 
+    const project = access.project;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-lint-'));
 
     try {
       let contentToLint: string;
 
       if (overrideContent !== undefined) {
-        // Single-file linting with provided content (backward compat)
         contentToLint = overrideContent;
       } else {
-        // Multi-file: write all project files and lint main.tex or specified file
         const files = db
           .prepare('SELECT path, content, is_folder FROM project_files WHERE project_id = ?')
           .all(req.params.id) as any[];
@@ -606,7 +615,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
         if (files.length === 0) {
           contentToLint = project.content;
         } else {
-          // Write all files to temp dir
           for (const file of files) {
             if (file.is_folder) continue;
             const relPath = file.path.startsWith('/') ? file.path.substring(1) : file.path;
@@ -621,7 +629,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
             }
           }
 
-          // Determine which file to lint
           let targetFile: any;
           if (overrideFileId) {
             targetFile = files.find((f: any) => f.id == overrideFileId && !f.is_folder);
@@ -645,7 +652,6 @@ export function createProjectRouter(upload: multer.Multer): Router {
       const texFile = path.join(tmpDir, 'main.tex');
       fs.writeFileSync(texFile, contentToLint);
 
-      // Check if chktex is available
       try {
         await execFileAsync('which', ['chktex'], { timeout: 5000 });
       } catch {
@@ -706,13 +712,11 @@ function isBinaryFile(filename: string, mimetype: string): boolean {
   if (mimetype && mimetype.startsWith('text/')) return false;
   if (mimetype === 'application/json') return false;
   const ext = path.extname(filename).toLowerCase();
-  // If it's not a known text extension, treat as binary
   const textExtensions = new Set([
     '.tex', '.txt', '.md', '.bib', '.sty', '.cls', '.cfg', '.csv',
     '.json', '.xml', '.html', '.css', '.js', '.ts', '.yaml', '.yml',
     '.latex', '.ltx', '.tikz',
   ]);
   if (textExtensions.has(ext)) return false;
-  // Default to binary for unknown extensions
   return true;
 }

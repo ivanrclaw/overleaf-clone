@@ -1,3 +1,4 @@
+import { JSX } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { ReactNode } from 'react';
 import { AuthProvider, useAuth } from '@/hooks/useAuth';
@@ -7,6 +8,7 @@ import Login from '@/components/Login';
 import Register from '@/components/Register';
 import Dashboard from '@/components/Dashboard';
 import Editor from '@/components/Editor';
+import InviteAccept from '@/components/InviteAccept';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { user, isLoading } = useAuth();
@@ -32,6 +34,7 @@ export default function App() {
           <Route path="/register" element={<Register />} />
           <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
           <Route path="/editor/:id" element={<ProtectedRoute><Editor /></ProtectedRoute>} />
+          <Route path="/invite/:token" element={<InviteAccept />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>
