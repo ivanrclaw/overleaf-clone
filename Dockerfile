@@ -31,6 +31,8 @@ RUN apt-get update && apt-get install -y \
 
 # Install tectonic via official installer script
 RUN curl -fsSL https://drop-sh.fullyjustified.net | sh \
+    && mv tectonic /usr/local/bin/tectonic \
+    && chmod +x /usr/local/bin/tectonic \
     && tectonic --version
 
 WORKDIR /app
