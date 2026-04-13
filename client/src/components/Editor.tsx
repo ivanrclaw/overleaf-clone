@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
+import { ProjectFile } from '@/types';
 import { EditorView } from '@codemirror/view';
 import { EditorState } from '@codemirror/state';
 import { latex } from 'codemirror-lang-latex';
@@ -11,6 +12,7 @@ import { autocompletion } from '@codemirror/autocomplete';
 import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 import { bracketMatching } from '@codemirror/language';
 import { keymap } from '@codemirror/view';
+import FileExplorer from '@/components/FileExplorer';
 import {
   ArrowLeft,
   Save,
@@ -19,9 +21,12 @@ import {
   Check,
   AlertCircle,
   FileText,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 
 type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'compiling';
+const AUTO_SAVE_DELAY = 3000; // 3 seconds
 
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
@@ -30,7 +35,8 @@ export default function Editor() {
 
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
-  const contentRef = useRef<string>('');
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [projectName, setProjectName] = useState('');
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
@@ -39,23 +45,65 @@ export default function Editor() {
   const [compileError, setCompileError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Save handler
-  const handleSave = useCallback(async () => {
-    if (!viewRef.current || saveStatus === 'saving') return;
-    const content = viewRef.current.state.doc.toString();
+  // Multi-file state
+  const [files, setFiles] = useState<ProjectFile[]>([]);
+  const [activeFileId, setActiveFileId] = useState<number | null>(null);
+  const [activeFileContent, setActiveFileContent] = useState<string>('');
+  const [activeFileName, setActiveFileName] = useState<string>('');
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [switchingFile, setSwitchingFile] = useState(false);
+
+  // Track the active file ID in a ref so callbacks can access current value
+  const activeFileIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    activeFileIdRef.current = activeFileId;
+  }, [activeFileId]);
+
+  // Save current active file
+  const saveCurrentFile = useCallback(async (fileId: number | null, content: string) => {
+    if (!fileId) return;
     setSaveStatus('saving');
     try {
-      await api.projects.save(projectId, content);
+      await api.projects.saveFile(projectId, fileId, { content });
       setSaveStatus('saved');
     } catch (err: any) {
-      alert('Save failed: ' + (err.message || 'Unknown error'));
+      console.error('Auto-save failed:', err.message);
       setSaveStatus('unsaved');
     }
-  }, [projectId, saveStatus]);
+  }, [projectId]);
+
+  // Auto-save handler
+  const handleAutoSave = useCallback(() => {
+    if (!viewRef.current || !activeFileIdRef.current) return;
+    const content = viewRef.current.state.doc.toString();
+    saveCurrentFile(activeFileIdRef.current, content);
+  }, [saveCurrentFile]);
+
+  // Manual save handler
+  const handleSave = useCallback(async () => {
+    if (!viewRef.current || !activeFileId || saveStatus === 'saving') return;
+    // Clear any pending auto-save timer
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    const content = viewRef.current.state.doc.toString();
+    await saveCurrentFile(activeFileId, content);
+  }, [activeFileId, saveStatus, saveCurrentFile]);
 
   // Compile handler
   const handleCompile = useCallback(async () => {
     if (saveStatus === 'compiling') return;
+    // Save current file first
+    if (viewRef.current && activeFileId) {
+      const content = viewRef.current.state.doc.toString();
+      try {
+        await saveCurrentFile(activeFileId, content);
+      } catch {
+        // Continue to compile even if save fails
+      }
+    }
     setSaveStatus('compiling');
     setCompileError(null);
     setPdfData(null);
@@ -70,17 +118,27 @@ export default function Editor() {
     } catch (err: any) {
       setCompileError(err.message || 'Compilation failed');
     } finally {
-      // Check if content has changed since compile started
-      setSaveStatus((prev) => prev === 'compiling' ? 'unsaved' : prev);
+      setSaveStatus((prev) => prev === 'compiling' ? 'saved' : prev);
     }
-  }, [projectId, saveStatus]);
+  }, [projectId, saveStatus, activeFileId, saveCurrentFile]);
 
-  // Initialize CodeMirror
-  useEffect(() => {
-    if (!editorRef.current || !loading) return;
-    // Will initialize after content loads
-  }, [loading]);
+  // Load files list
+  const loadFiles = useCallback(async () => {
+    setFilesLoading(true);
+    try {
+      const data = await api.projects.listFiles(projectId);
+      setFiles(data.files.map(f => ({
+        ...f,
+        is_folder: !!f.is_folder,
+      })));
+    } catch (err: any) {
+      console.error('Failed to load files:', err.message);
+    } finally {
+      setFilesLoading(false);
+    }
+  }, [projectId]);
 
+  // Load project + files on mount
   useEffect(() => {
     let cancelled = false;
 
@@ -89,8 +147,6 @@ export default function Editor() {
         const data = await api.projects.get(projectId);
         if (cancelled) return;
         setProjectName(data.project.name);
-        contentRef.current = data.project.content || '';
-        setLoading(false);
       } catch (err: any) {
         if (!cancelled) {
           setError(err.message || 'Failed to load project');
@@ -99,13 +155,169 @@ export default function Editor() {
       }
     };
 
+    const loadProjectFiles = async () => {
+      try {
+        const data = await api.projects.listFiles(projectId);
+        if (cancelled) return;
+        const filelist = data.files.map(f => ({
+          ...f,
+          is_folder: !!f.is_folder,
+        }));
+        setFiles(filelist);
+
+        // Auto-select main.tex if it exists
+        const mainTex = filelist.find((f: ProjectFile) => f.path === '/main.tex' && !f.is_folder);
+        if (mainTex) {
+          setActiveFileId(mainTex.id);
+          setActiveFileName(mainTex.name);
+          // Load file content
+          try {
+            const fileData = await api.projects.getFile(projectId, mainTex.id);
+            if (!cancelled) {
+              setActiveFileContent(fileData.file.content || '');
+            }
+          } catch {
+            if (!cancelled) setActiveFileContent('');
+          }
+        } else if (filelist.length > 0) {
+          // Select first non-folder file
+          const firstFile = filelist.find((f: ProjectFile) => !f.is_folder);
+          if (firstFile) {
+            setActiveFileId(firstFile.id);
+            setActiveFileName(firstFile.name);
+            try {
+              const fileData = await api.projects.getFile(projectId, firstFile.id);
+              if (!cancelled) {
+                setActiveFileContent(fileData.file.content || '');
+              }
+            } catch {
+              if (!cancelled) setActiveFileContent('');
+            }
+          }
+        }
+
+        setLoading(false);
+      } catch (err: any) {
+        if (!cancelled) {
+          console.error('Failed to load files:', err.message);
+          setLoading(false);
+        }
+      }
+    };
+
     loadProject();
+    loadProjectFiles();
     return () => { cancelled = true; };
   }, [projectId]);
 
-  // Initialize editor after content loads
+  // Handle file selection
+  const handleFileSelect = useCallback(async (file: ProjectFile) => {
+    if (file.is_folder || file.id === activeFileId) return;
+
+    // Save current file before switching
+    if (viewRef.current && activeFileId) {
+      const content = viewRef.current.state.doc.toString();
+      try {
+        await api.projects.saveFile(projectId, activeFileId, { content });
+      } catch {
+        // Continue switching even if save fails
+      }
+    }
+
+    // Clear auto-save timer
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+
+    setSwitchingFile(true);
+    setActiveFileId(file.id);
+    setActiveFileName(file.name);
+
+    try {
+      const data = await api.projects.getFile(projectId, file.id);
+      setActiveFileContent(data.file.content || '');
+    } catch {
+      setActiveFileContent('');
+    } finally {
+      setSwitchingFile(false);
+      setSaveStatus('saved');
+    }
+  }, [activeFileId, projectId]);
+
+  // Handle file creation
+  const handleFileCreate = useCallback(async (name: string, path: string, isFolder: boolean) => {
+    try {
+      const data = await api.projects.createFile(projectId, name, path, isFolder);
+      // Refresh file list
+      await loadFiles();
+      // If it's a file (not folder), select it
+      if (!isFolder && data.file) {
+        handleFileSelect({
+          ...data.file,
+          is_folder: false,
+          created_at: '',
+          updated_at: '',
+        } as ProjectFile);
+      }
+    } catch (err: any) {
+      alert('Failed to create file: ' + (err.message || 'Unknown error'));
+    }
+  }, [projectId, loadFiles, handleFileSelect]);
+
+  // Handle file deletion
+  const handleFileDelete = useCallback(async (file: ProjectFile) => {
+    const confirmed = confirm(`Delete "${file.name}"? This cannot be undone.`);
+    if (!confirmed) return;
+
+    try {
+      await api.projects.deleteFile(projectId, file.id);
+      // If deleting active file, clear it
+      if (file.id === activeFileId) {
+        setActiveFileId(null);
+        setActiveFileContent('');
+        setActiveFileName('');
+      }
+      await loadFiles();
+    } catch (err: any) {
+      alert('Failed to delete file: ' + (err.message || 'Unknown error'));
+    }
+  }, [projectId, activeFileId, loadFiles]);
+
+  // Handle file upload
+  const handleFileUpload = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const onFilesSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = e.target.files;
+    if (!selectedFiles || selectedFiles.length === 0) return;
+
+    try {
+      await api.projects.uploadFiles(projectId, Array.from(selectedFiles), '/');
+      await loadFiles();
+    } catch (err: any) {
+      alert('Upload failed: ' + (err.message || 'Unknown error'));
+    }
+
+    // Reset input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }, [projectId, loadFiles]);
+
+  // Initialize / re-initialize CodeMirror when active file changes
   useEffect(() => {
-    if (loading || !editorRef.current) return;
+    if (loading || switchingFile || !editorRef.current) return;
+    if (!activeFileId && activeFileContent === '' && files.length > 0) return;
+
+    // Destroy existing view
+    if (viewRef.current) {
+      viewRef.current.destroy();
+      viewRef.current = null;
+    }
+
+    const currentActiveId = activeFileId;
 
     const saveKeymap = keymap.of([
       {
@@ -148,7 +360,7 @@ export default function Editor() {
     }, { delay: 1000 });
 
     const state = EditorState.create({
-      doc: contentRef.current,
+      doc: activeFileContent,
       extensions: [
         latex(),
         oneDark,
@@ -167,6 +379,12 @@ export default function Editor() {
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             setSaveStatus('unsaved');
+            // Clear existing auto-save timer
+            if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+            // Set new auto-save timer
+            autoSaveTimerRef.current = setTimeout(() => {
+              handleAutoSave();
+            }, AUTO_SAVE_DELAY);
           }
         }),
         EditorView.theme({
@@ -185,9 +403,24 @@ export default function Editor() {
 
     return () => {
       view.destroy();
-      viewRef.current = null;
+      if (viewRef.current === view) {
+        viewRef.current = null;
+      }
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
     };
-  }, [loading, projectId, handleSave]);
+  }, [loading, switchingFile, activeFileId, activeFileContent, projectId, handleSave, handleAutoSave]);
+
+  // Cleanup auto-save timer on unmount
+  useEffect(() => {
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, []);
 
   if (error) {
     return (
@@ -208,9 +441,25 @@ export default function Editor() {
 
   return (
     <div className="flex h-[calc(100vh-4rem)] flex-col bg-gray-100 dark:bg-gray-900">
+      {/* Hidden file input for uploads */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={onFilesSelected}
+      />
+
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-gray-200 bg-white px-4 py-2 dark:border-gray-800 dark:bg-gray-950">
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setSidebarCollapsed(prev => !prev)}
+            className="rounded p-1 text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
+            title={sidebarCollapsed ? 'Show file explorer' : 'Hide file explorer'}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+          </button>
           <button
             onClick={() => navigate('/dashboard')}
             className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
@@ -222,6 +471,12 @@ export default function Editor() {
           <div className="flex items-center gap-2">
             <FileText className="h-4 w-4 text-brand-500" />
             <span className="text-sm font-medium text-gray-900 dark:text-gray-100">{projectName}</span>
+            {activeFileName && (
+              <>
+                <span className="text-gray-400 dark:text-gray-600">/</span>
+                <span className="text-sm text-gray-500 dark:text-gray-400">{activeFileName}</span>
+              </>
+            )}
           </div>
         </div>
 
@@ -256,7 +511,7 @@ export default function Editor() {
 
           <button
             onClick={handleSave}
-            disabled={saveStatus === 'saving'}
+            disabled={saveStatus === 'saving' || !activeFileId}
             className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
           >
             <Save className="h-3.5 w-3.5" />
@@ -299,11 +554,33 @@ export default function Editor() {
         </div>
       )}
 
-      {/* Editor + Preview split */}
+      {/* Editor + Explorer + Preview split */}
       {!loading && (
         <div className="flex flex-1 overflow-hidden">
+          {/* File Explorer Sidebar */}
+          {!sidebarCollapsed && (
+            <div className="w-52 flex-shrink-0 overflow-hidden">
+              <FileExplorer
+                files={files}
+                activeFileId={activeFileId}
+                onFileSelect={handleFileSelect}
+                onFileCreate={handleFileCreate}
+                onFileDelete={handleFileDelete}
+                onFileUpload={handleFileUpload}
+                loading={filesLoading}
+              />
+            </div>
+          )}
+
           {/* CodeMirror Editor */}
-          <div className="w-1/2 border-r border-gray-200 dark:border-gray-800" ref={editorRef} />
+          <div className="flex-1 border-r border-gray-200 dark:border-gray-800" ref={editorRef}>
+            {!activeFileId && (
+              <div className="flex h-full flex-col items-center justify-center text-gray-400 dark:text-gray-600">
+                <FileText className="mb-2 h-10 w-10" />
+                <p className="text-sm">Select a file to edit</p>
+              </div>
+            )}
+          </div>
 
           {/* PDF Preview */}
           <div className="flex w-1/2 flex-col bg-gray-50 dark:bg-gray-950">

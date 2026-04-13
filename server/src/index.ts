@@ -5,11 +5,18 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import multer from 'multer';
 import authRoutes from './routes/auth';
-import projectRoutes from './routes/projects';
+import { createProjectRouter } from './routes/projects';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
+
+// Multer configuration for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+});
 
 // Middleware
 app.use(cors());
@@ -17,7 +24,7 @@ app.use(express.json({ limit: '10mb' }));
 
 // API routes
 app.use('/api/auth', authRoutes);
-app.use('/api/projects', projectRoutes);
+app.use('/api/projects', createProjectRouter(upload));
 
 // Serve static files from client/dist in production
 const clientDistPath = path.join(__dirname, '../client/dist');

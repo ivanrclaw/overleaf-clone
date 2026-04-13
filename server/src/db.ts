@@ -35,6 +35,25 @@ db.exec(`
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS project_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    is_folder INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, path)
+  );
 `);
+
+// Add auto_save_interval column to projects (may already exist from prior migrations)
+try {
+  db.exec('ALTER TABLE projects ADD COLUMN auto_save_interval INTEGER DEFAULT 5');
+} catch {
+  // Column already exists — ignore
+}
 
 export default db;

@@ -9,6 +9,17 @@ export interface Project {
   content?: string;
   created_at: string;
   updated_at: string;
+  auto_save_interval?: number;
+}
+
+export interface ProjectFile {
+  id: number;
+  name: string;
+  path: string;
+  content?: string;
+  is_folder: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LintDiagnostic {
