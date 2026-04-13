@@ -17,11 +17,16 @@ RUN npm run build
 # Production image
 FROM node:20-bookworm-slim
 
-# Install chktex from Debian repos + curl for tectonic
+# Install chktex + tectonic runtime dependencies
 RUN apt-get update && apt-get install -y \
     chktex \
     ca-certificates \
     curl \
+    libgraphite2-3 \
+    libicu72 \
+    libharfbuzz0b \
+    libfontconfig1 \
+    libpng16-16 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install tectonic 0.16.8 from GitHub release
