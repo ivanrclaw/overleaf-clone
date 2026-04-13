@@ -549,30 +549,57 @@ export function createProjectRouter(upload: multer.Multer): Router {
       try {
         await execFileAsync('which', ['pdflatex'], { timeout: 5000 });
         compileCmd = 'pdflatex';
-        compileArgs = ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
-        if (draft) {
-          compileArgs = ['-draftmode', '-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
-        }
+        // In draft mode, \documentclass[draft] is already injected in the .tex file above.
+        // We do NOT use pdflatex -draftmode because that skips PDF generation entirely.
+        compileArgs = ['-interaction=nonstopmode', '-output-directory', tmpDir, texFile];
       } catch {
         compileCmd = 'tectonic';
         compileArgs = [texFile];
       }
 
-      const { stderr } = await execFileAsync(compileCmd, compileArgs, {
-        cwd: tmpDir,
-        timeout: 30000,
-      });
-
-      const pdfPath = path.join(tmpDir, 'main.pdf');
-      if (!fs.existsSync(pdfPath)) {
-        res.status(500).json({ error: 'Compilation failed', log: 'PDF file not generated' });
-        return;
+      let compileResult: { stdout: string; stderr: string };
+      try {
+        compileResult = await execFileAsync(compileCmd, compileArgs, {
+          cwd: tmpDir,
+          timeout: 30000,
+        });
+      } catch (err: any) {
+        // pdflatex exits with code 1 on LaTeX errors, but stderr has the log
+        compileResult = { stdout: err.stdout || '', stderr: err.stderr || err.message || '' };
       }
 
-      const pdfBuffer = fs.readFileSync(pdfPath);
-      const pdfBase64 = pdfBuffer.toString('base64');
+      const pdfPath = path.join(tmpDir, 'main.pdf');
+      if (fs.existsSync(pdfPath)) {
+        const pdfBuffer = fs.readFileSync(pdfPath);
+        const pdfBase64 = pdfBuffer.toString('base64');
 
-      res.json({ pdf: pdfBase64 });
+        // Parse warnings/errors from log for the frontend
+        const fullLog = compileResult.stdout + compileResult.stderr;
+        const compileErrors = parseLatexLog(fullLog);
+
+        res.json({ pdf: pdfBase64, compileErrors: compileErrors.length > 0 ? compileErrors : undefined });
+      } else {
+        // Compilation failed — parse errors from log
+        const fullLog = compileResult.stdout + compileResult.stderr;
+        const compileErrors = parseLatexLog(fullLog);
+
+        // Also try to read the .log file for more detail
+        const logPath = path.join(tmpDir, 'main.log');
+        let logContent = fullLog;
+        if (fs.existsSync(logPath)) {
+          logContent = fs.readFileSync(logPath, 'utf-8');
+        }
+
+        const allErrors = compileErrors.length > 0 ? compileErrors : parseLatexLog(logContent);
+
+        res.status(200).json({
+          error: allErrors.length > 0
+            ? allErrors.map((e: any) => `Line ${e.line}: ${e.message}`).join('\n')
+            : 'Compilation failed — no PDF generated',
+          log: logContent,
+          compileErrors: allErrors,
+        });
+      }
     } catch (err: any) {
       const stderr = err.stderr || err.message || '';
       res.status(500).json({ error: 'Compilation failed', log: stderr });
@@ -719,4 +746,81 @@ function isBinaryFile(filename: string, mimetype: string): boolean {
   ]);
   if (textExtensions.has(ext)) return false;
   return true;
+}
+
+// Parse pdflatex log output for errors and warnings
+function parseLatexLog(log: string): { line: number; message: string; severity: 'error' | 'warning'; file?: string }[] {
+  const results: { line: number; message: string; severity: 'error' | 'warning'; file?: string }[] = [];
+  if (!log) return results;
+
+  const lines = log.split('\n');
+  let currentFile: string | undefined;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Track current file: matches lines like "(./main.tex" or "(./chapters/intro.tex"
+    const fileMatch = line.match(/\(\.?\/([^\s()]+\.(?:tex|sty|cls|bib))/);
+    if (fileMatch) {
+      currentFile = fileMatch[1];
+    }
+
+    // Match LaTeX errors: "! LaTeX Error: ..." or "! ..."
+    const errorMatch = line.match(/^!\s+(.+)$/);
+    if (errorMatch) {
+      // Look ahead for line number: "l.42" or "l.42 ..."
+      let errorLine = 0;
+      let errorMsg = errorMatch[1];
+      for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+        const lineNumMatch = lines[j].match(/^l\.(\d+)/);
+        if (lineNumMatch) {
+          errorLine = parseInt(lineNumMatch[1], 10);
+          // Include the context after l.N
+          const contextAfter = lines[j].replace(/^l\.\d+\s*/, '').trim();
+          if (contextAfter) errorMsg += ' — ' + contextAfter;
+          break;
+        }
+      }
+      results.push({
+        line: errorLine,
+        message: errorMsg,
+        severity: 'error',
+        file: currentFile,
+      });
+    }
+
+    // Match warnings: "LaTeX Warning: ..."
+    const warnMatch = line.match(/LaTeX Warning:\s+(.+)/);
+    if (warnMatch) {
+      let warnLine = 0;
+      const lineNumMatch = line.match(/on input line (\d+)/);
+      if (lineNumMatch) warnLine = parseInt(lineNumMatch[1], 10);
+      // If line number not in same line, check next lines
+      if (!lineNumMatch) {
+        for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+          const nextMatch = lines[j].match(/on input line (\d+)/);
+          if (nextMatch) { warnLine = parseInt(nextMatch[1], 10); break; }
+        }
+      }
+      results.push({
+        line: warnLine,
+        message: warnMatch[1].replace(/\s+on input line \d+\.?$/, '').trim(),
+        severity: 'warning',
+        file: currentFile,
+      });
+    }
+
+    // Match "Underfull \hbox" and "Overfull \hbox" warnings
+    const hboxMatch = line.match(/(Underfull|Overfull) \\[hv]box .+ at lines? (\d+)/);
+    if (hboxMatch) {
+      results.push({
+        line: parseInt(hboxMatch[2], 10),
+        message: `${hboxMatch[1]} box detected`,
+        severity: 'warning',
+        file: currentFile,
+      });
+    }
+  }
+
+  return results;
 }

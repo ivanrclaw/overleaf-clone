@@ -123,7 +123,7 @@ export const api = {
     delete: (id: number) =>
       request<{ ok: boolean }>(`/projects/${id}`, { method: 'DELETE' }),
     compile: (id: number, draft: boolean = false) =>
-      request<{ pdf?: string; error?: string; log?: string }>(`/projects/${id}/compile`, {
+      request<{ pdf?: string; error?: string; log?: string; compileErrors?: import('@/types').CompileError[] }>(`/projects/${id}/compile`, {
         method: 'POST',
         body: JSON.stringify({ draft }),
       }),

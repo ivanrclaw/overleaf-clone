@@ -70,3 +70,10 @@ export interface CollaboratorInfo {
   cursor?: { line: number; col: number };
   selection?: { fromLine: number; fromCol: number; toLine: number; toCol: number };
 }
+
+export interface CompileError {
+  line: number;
+  message: string;
+  severity: 'error' | 'warning';
+  file?: string;
+}

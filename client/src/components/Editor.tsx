@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
-import { ProjectFile } from '@/types';
+import { ProjectFile, CompileError } from '@/types';
 import { useAuth } from '@/hooks/useAuth';
 import { useCollaboration, CollaboratorInfo } from '@/hooks/useCollaboration';
-import { EditorView } from '@codemirror/view';
-import { EditorState } from '@codemirror/state';
+import { EditorView, ViewPlugin, Decoration, DecorationSet, ViewUpdate } from '@codemirror/view';
+import { EditorState, Compartment, Range } from '@codemirror/state';
 import { latex } from 'codemirror-lang-latex';
 import { linter, lintGutter, Diagnostic } from '@codemirror/lint';
 import { oneDark } from '@codemirror/theme-one-dark';
@@ -23,6 +23,7 @@ import {
   Loader2,
   Check,
   AlertCircle,
+  AlertTriangle,
   FileText,
   PanelLeftClose,
   PanelLeftOpen,
@@ -32,6 +33,8 @@ import {
   Share2,
   Users,
   Eye,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'compiling';
@@ -56,6 +59,54 @@ function getCollabColor(userId: number): string {
   return COLLAB_COLORS[userId % COLLAB_COLORS.length];
 }
 
+// Compile error line highlighter for CodeMirror
+const errorHighlightCompartment = new Compartment();
+
+const errorLineDeco = Decoration.line({ class: 'cm-compile-error-line' });
+const warningLineDeco = Decoration.line({ class: 'cm-compile-warning-line' });
+
+function makeCompileErrorHighlighter(errors: CompileError[]) {
+  return ViewPlugin.define((view: EditorView) => ({
+    decorations: buildErrorDecorations(view, errors),
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged) {
+        this.decorations = buildErrorDecorations(update.view, errors);
+      }
+    },
+  }), {
+    decorations: (v) => v.decorations,
+  });
+}
+
+function buildErrorDecorations(view: EditorView, errors: CompileError[]): DecorationSet {
+  const builder: Range<Decoration>[] = [];
+  for (const err of errors) {
+    if (err.line >= 1 && err.line <= view.state.doc.lines) {
+      const line = view.state.doc.line(err.line);
+      builder.push((err.severity === 'error' ? errorLineDeco : warningLineDeco).range(line.from));
+    }
+  }
+  return Decoration.set(builder, true);
+}
+
+// CSS for compile error/warning line highlighting
+const compileErrorHighlightTheme = EditorView.baseTheme({
+  '.cm-compile-error-line': {
+    backgroundColor: 'rgba(239, 68, 68, 0.15) !important',
+    borderLeft: '3px solid #ef4444',
+  },
+  '.cm-compile-warning-line': {
+    backgroundColor: 'rgba(245, 158, 11, 0.15) !important',
+    borderLeft: '3px solid #f59e0b',
+  },
+  '&dark .cm-compile-error-line': {
+    backgroundColor: 'rgba(239, 68, 68, 0.2) !important',
+  },
+  '&dark .cm-compile-warning-line': {
+    backgroundColor: 'rgba(245, 158, 11, 0.2) !important',
+  },
+});
+
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -77,6 +128,8 @@ export default function Editor() {
   const [loading, setLoading] = useState(true);
   const [pdfData, setPdfData] = useState<string | null>(null);
   const [compileError, setCompileError] = useState<string | null>(null);
+  const [compileErrors, setCompileErrors] = useState<CompileError[]>([]);
+  const [errorsPanelExpanded, setErrorsPanelExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Multi-file state
@@ -101,6 +154,9 @@ export default function Editor() {
   const activeFileIdRef = useRef<number | null>(null);
   useEffect(() => { activeFileIdRef.current = activeFileId; }, [activeFileId]);
 
+  // Guard to avoid overwriting content when the local user just saved
+  const justSavedLocallyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const autoCompileRef = useRef(false);
   const draftModeRef = useRef(false);
   useEffect(() => { autoCompileRef.current = autoCompile; }, [autoCompile]);
@@ -113,6 +169,7 @@ export default function Editor() {
     myRole: wsRole,
     isViewer,
     sendCursor,
+    sendEdit,
     sendFileCreated,
     sendFileDeleted,
     sendFileMoved,
@@ -120,10 +177,40 @@ export default function Editor() {
   } = useCollaboration({
     projectId,
     token,
+    onEdit: () => {
+      // Edit deltas received — in the future, apply OT here.
+      // For now, full-content reloads happen via onFileSaved.
+    },
     onFileCreated: () => { loadFiles(); },
     onFileDeleted: () => { loadFiles(); },
     onFileMoved: () => { loadFiles(); },
-    onFileSaved: () => { /* files auto-refresh on save */ },
+    onFileSaved: (data) => {
+      // When a collaborator saves a file, reload its content if it's the active file
+      const savedFileId = data.fileId;
+      if (savedFileId !== activeFileIdRef.current) return;
+
+      // Don't overwrite if we just saved locally (avoid race condition)
+      if (justSavedLocallyRef.current) return;
+
+      // Fetch fresh content from the server and update CodeMirror in-place
+      (async () => {
+        try {
+          const fileData = await api.projects.getFile(projectId, savedFileId);
+          const newContent = fileData.file.content || '';
+          if (viewRef.current) {
+            const currentContent = viewRef.current.state.doc.toString();
+            if (currentContent !== newContent) {
+              viewRef.current.dispatch({
+                changes: { from: 0, to: viewRef.current.state.doc.length, insert: newContent },
+              });
+              setSaveStatus('saved');
+            }
+          }
+        } catch (err: any) {
+          console.error('Failed to reload file after collaborator save:', err.message);
+        }
+      })();
+    },
     onConnected: (_users, role) => { setUserRole(role); },
   });
 
@@ -131,6 +218,20 @@ export default function Editor() {
   useEffect(() => { if (wsRole) setUserRole(wsRole); }, [wsRole]);
 
   const isReadOnly = isViewer;
+
+  // Jump to a specific line in the CodeMirror editor
+  const jumpToLine = useCallback((line: number) => {
+    if (!viewRef.current) return;
+    const doc = viewRef.current.state.doc;
+    if (line >= 1 && line <= doc.lines) {
+      const lineInfo = doc.line(line);
+      viewRef.current.dispatch({
+        selection: { anchor: lineInfo.from },
+        scrollIntoView: true,
+      });
+      viewRef.current.focus();
+    }
+  }, []);
 
   // Save current active file
   const saveCurrentFile = useCallback(async (fileId: number | null, content: string) => {
@@ -140,6 +241,11 @@ export default function Editor() {
       await api.projects.saveFile(projectId, fileId, { content });
       setSaveStatus('saved');
       sendFileSaved(fileId);
+      // Guard: prevent incoming file_saved echo from overwriting our content for 2 seconds
+      if (justSavedLocallyRef.current) clearTimeout(justSavedLocallyRef.current);
+      justSavedLocallyRef.current = setTimeout(() => {
+        justSavedLocallyRef.current = null;
+      }, 2000);
     } catch (err: any) {
       console.error('Auto-save failed:', err.message);
       setSaveStatus('unsaved');
@@ -149,13 +255,28 @@ export default function Editor() {
   // Auto-compile
   const handleAutoCompile = useCallback(async () => {
     setCompileError(null);
+    setCompileErrors([]);
+    if (viewRef.current) {
+      viewRef.current.dispatch({
+        effects: errorHighlightCompartment.reconfigure(makeCompileErrorHighlighter([])),
+      });
+    }
     setSaveStatus('compiling');
     try {
       const data = await api.projects.compile(projectId, draftModeRef.current);
       if (data.pdf) setPdfData(data.pdf);
       if (data.error) setCompileError(data.error);
+      const errs = data.compileErrors || [];
+      setCompileErrors(errs);
+      if (errs.length > 0) setErrorsPanelExpanded(true);
+      if (viewRef.current) {
+        viewRef.current.dispatch({
+          effects: errorHighlightCompartment.reconfigure(makeCompileErrorHighlighter(errs)),
+        });
+      }
     } catch (err: any) {
       setCompileError(err.message || 'Auto-compile failed');
+      setCompileErrors([]);
     } finally {
       setSaveStatus('saved');
     }
@@ -198,13 +319,28 @@ export default function Editor() {
     }
     setSaveStatus('compiling');
     setCompileError(null);
+    setCompileErrors([]);
+    if (viewRef.current) {
+      viewRef.current.dispatch({
+        effects: errorHighlightCompartment.reconfigure(makeCompileErrorHighlighter([])),
+      });
+    }
     setPdfData(null);
     try {
       const data = await api.projects.compile(projectId, draftMode);
       if (data.pdf) setPdfData(data.pdf);
       if (data.error) setCompileError(data.error);
+      const errs = data.compileErrors || [];
+      setCompileErrors(errs);
+      if (errs.length > 0) setErrorsPanelExpanded(true);
+      if (viewRef.current) {
+        viewRef.current.dispatch({
+          effects: errorHighlightCompartment.reconfigure(makeCompileErrorHighlighter(errs)),
+        });
+      }
     } catch (err: any) {
       setCompileError(err.message || 'Compilation failed');
+      setCompileErrors([]);
     } finally {
       setSaveStatus((prev) => prev === 'compiling' ? 'saved' : prev);
     }
@@ -394,6 +530,8 @@ export default function Editor() {
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
         saveKeymap,
         EditorState.readOnly.of(isReadOnly),
+        errorHighlightCompartment.of(makeCompileErrorHighlighter([])),
+        compileErrorHighlightTheme,
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             setSaveStatus('unsaved');
@@ -420,6 +558,7 @@ export default function Editor() {
     return () => {
       if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
       if (autoCompileTimerRef.current) clearTimeout(autoCompileTimerRef.current);
+      if (justSavedLocallyRef.current) clearTimeout(justSavedLocallyRef.current);
     };
   }, []);
 
@@ -551,8 +690,8 @@ export default function Editor() {
         </div>
       </div>
 
-      {/* Compile error banner */}
-      {compileError && (
+      {/* Compile error banner — only for raw error text (no structured errors) */}
+      {compileError && compileErrors.length === 0 && (
         <div className="border-b border-red-200 bg-red-50 px-4 py-3 dark:border-red-800 dark:bg-red-950">
           <div className="flex items-start gap-2">
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-500" />
@@ -621,17 +760,95 @@ export default function Editor() {
 
           {/* PDF Preview */}
           <div className="flex w-1/2 flex-col bg-gray-50 dark:bg-gray-950">
-            {pdfData ? (
-              <iframe src={`data:application/pdf;base64,${pdfData}`} className="flex-1" title="PDF Preview" style={{ border: 'none' }} />
-            ) : (
-              <div className="flex flex-1 flex-col items-center justify-center">
-                <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-2xl bg-gray-100 dark:bg-gray-800">
-                  <FileText className="h-10 w-10 text-gray-400 dark:text-gray-600" />
+            <div className="flex-1 overflow-hidden">
+              {pdfData ? (
+                <iframe src={`data:application/pdf;base64,${pdfData}`} className="h-full w-full" title="PDF Preview" style={{ border: 'none' }} />
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center">
+                  <div className="mb-4 flex h-20 w-20 items-center justify-center rounded-2xl bg-gray-100 dark:bg-gray-800">
+                    <FileText className="h-10 w-10 text-gray-400 dark:text-gray-600" />
+                  </div>
+                  <p className="text-sm font-medium text-gray-500 dark:text-gray-400">No PDF preview</p>
+                  <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+                    {autoCompile ? 'PDF will auto-generate on save' : 'Click "Compile" to generate a PDF'}
+                  </p>
                 </div>
-                <p className="text-sm font-medium text-gray-500 dark:text-gray-400">No PDF preview</p>
-                <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-                  {autoCompile ? 'PDF will auto-generate on save' : 'Click "Compile" to generate a PDF'}
-                </p>
+              )}
+            </div>
+
+            {/* Compile Errors Panel (like OverLeaf "Logs and output files") */}
+            {(compileErrors.length > 0 || compileError) && (
+              <div className="flex flex-col border-t border-gray-200 dark:border-gray-800">
+                {/* Panel header — clickable to expand/collapse */}
+                <button
+                  onClick={() => setErrorsPanelExpanded(prev => !prev)}
+                  className="flex items-center justify-between bg-gray-100 px-3 py-1.5 text-left hover:bg-gray-200 dark:bg-gray-900 dark:hover:bg-gray-800"
+                >
+                  <div className="flex items-center gap-2">
+                    {errorsPanelExpanded ? (
+                      <ChevronUp className="h-3.5 w-3.5 text-gray-500" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5 text-gray-500" />
+                    )}
+                    <span className="text-xs font-semibold text-gray-700 dark:text-gray-300">Logs &amp; Output</span>
+                    {compileErrors.length > 0 && (
+                      <div className="flex items-center gap-1">
+                        {compileErrors.filter(e => e.severity === 'error').length > 0 && (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-bold text-red-700 dark:bg-red-900 dark:text-red-300">
+                            <AlertCircle className="h-2.5 w-2.5" />
+                            {compileErrors.filter(e => e.severity === 'error').length} Error{compileErrors.filter(e => e.severity === 'error').length !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                        {compileErrors.filter(e => e.severity === 'warning').length > 0 && (
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900 dark:text-amber-300">
+                            <AlertTriangle className="h-2.5 w-2.5" />
+                            {compileErrors.filter(e => e.severity === 'warning').length} Warning{compileErrors.filter(e => e.severity === 'warning').length !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {compileError && compileErrors.length === 0 && (
+                      <span className="inline-flex items-center gap-0.5 rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-bold text-red-700 dark:bg-red-900 dark:text-red-300">
+                        <AlertCircle className="h-2.5 w-2.5" />1 Error
+                      </span>
+                    )}
+                  </div>
+                </button>
+
+                {/* Panel body — scrollable error list */}
+                {errorsPanelExpanded && (
+                  <div className="max-h-48 overflow-y-auto bg-white dark:bg-gray-950">
+                    {compileErrors.map((err, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => jumpToLine(err.line)}
+                        className="flex w-full items-start gap-2 border-b border-gray-100 px-3 py-1.5 text-left transition-colors hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-900"
+                      >
+                        {err.severity === 'error' ? (
+                          <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-red-500" />
+                        ) : (
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-amber-500" />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 text-xs font-medium text-gray-800 dark:text-gray-200">
+                            {err.file && <span className="text-gray-500 dark:text-gray-400">{err.file}:</span>}
+                            <span className={err.severity === 'error' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}>
+                              line {err.line}
+                            </span>
+                          </div>
+                          <p className={`mt-0.5 text-xs ${err.severity === 'error' ? 'text-red-500 dark:text-red-400' : 'text-amber-500 dark:text-amber-400'}`}>
+                            {err.message}
+                          </p>
+                        </div>
+                      </button>
+                    ))}
+                    {compileError && compileErrors.length === 0 && (
+                      <div className="px-3 py-2">
+                        <pre className="whitespace-pre-wrap text-xs text-red-600 dark:text-red-400">{compileError}</pre>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
