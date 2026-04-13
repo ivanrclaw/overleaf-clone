@@ -364,6 +364,10 @@ export default function Editor() {
     if (!activeFileId && activeFileContent === '' && files.length > 0) return;
     if (isImageFile(activeFileName)) return;
 
+    // Before destroying the old view, capture its current content
+    // This prevents reverting to stale activeFileContent after autosave
+    const currentContent = viewRef.current ? viewRef.current.state.doc.toString() : activeFileContent;
+
     if (viewRef.current) { viewRef.current.destroy(); viewRef.current = null; }
 
     const saveKeymap = keymap.of([{ key: 'Mod-s', run: () => { saveCallbackRef.current(); return true; } }]);
@@ -384,7 +388,7 @@ export default function Editor() {
     }, { delay: 1000 });
 
     const state = EditorState.create({
-      doc: activeFileContent,
+      doc: currentContent,
       extensions: [
         latex(), oneDark, lintGutter(), lintExtension, history(), highlightSelectionMatches(), bracketMatching(), autocompletion(),
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
