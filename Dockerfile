@@ -14,22 +14,24 @@ RUN npm ci
 COPY server/ ./
 RUN npm run build
 
-# Production image — use bookworm (not slim) for glibc 2.36 compatibility
-FROM node:20-bookworm
+# Production image — Ubuntu Noble has glibc 2.39 for tectonic compatibility
+FROM ubuntu:24.04
 
-# Install chktex + tectonic via official installer + runtime deps
+# Install Node.js 20, chktex, and runtime deps
 RUN apt-get update && apt-get install -y \
-    chktex \
     ca-certificates \
     curl \
+    chktex \
     libgraphite2-3 \
-    libicu72 \
+    libicu74 \
     libharfbuzz0b \
     libfontconfig1 \
     libpng16-16 \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tectonic via official installer script
+# Install tectonic via official installer
 RUN curl -fsSL https://drop-sh.fullyjustified.net | sh \
     && mv tectonic /usr/local/bin/tectonic \
     && chmod +x /usr/local/bin/tectonic \
