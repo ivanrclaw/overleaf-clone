@@ -89,8 +89,11 @@ export const api = {
       }),
     delete: (id: number) =>
       request<{ ok: boolean }>(`/projects/${id}`, { method: 'DELETE' }),
-    compile: (id: number) =>
-      request<{ pdf?: string; error?: string; log?: string }>(`/projects/${id}/compile`, { method: 'POST' }),
+    compile: (id: number, draft: boolean = false) =>
+      request<{ pdf?: string; error?: string; log?: string }>(`/projects/${id}/compile`, {
+        method: 'POST',
+        body: JSON.stringify({ draft }),
+      }),
     lint: (id: number, content: string) =>
       request<{ diagnostics: { from: { line: number; col: number }; to: { line: number; col: number }; severity: string; message: string }[] }>(`/projects/${id}/lint`, {
         method: 'POST',
@@ -110,6 +113,11 @@ export const api = {
       request<{ file: { id: number; name: string; path: string; content: string; is_folder: boolean; updated_at: string } }>(`/projects/${projectId}/files/${fileId}`, {
         method: 'PUT',
         body: JSON.stringify(data),
+      }),
+    moveFile: (projectId: number, fileId: number, newPath: string) =>
+      request<{ file: { id: number; name: string; path: string; is_folder: boolean; created_at: string; updated_at: string } }>(`/projects/${projectId}/files/${fileId}/move`, {
+        method: 'PATCH',
+        body: JSON.stringify({ newPath }),
       }),
     deleteFile: (projectId: number, fileId: number) =>
       request<{ ok: boolean }>(`/projects/${projectId}/files/${fileId}`, { method: 'DELETE' }),

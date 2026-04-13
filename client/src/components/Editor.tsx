@@ -24,10 +24,13 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   ImageIcon,
+  Zap,
+  PencilLine,
 } from 'lucide-react';
 
 type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'compiling';
 const AUTO_SAVE_DELAY = 3000; // 3 seconds
+const AUTO_COMPILE_DELAY = 2000; // 2 seconds after save
 
 // Image extensions that should be previewed instead of edited
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg']);
@@ -46,6 +49,7 @@ export default function Editor() {
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoCompileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Refs for stable callbacks inside CodeMirror extensions
@@ -70,11 +74,21 @@ export default function Editor() {
   // Image preview state
   const [activeImageSrc, setActiveImageSrc] = useState<string | null>(null);
 
+  // Compilation options
+  const [autoCompile, setAutoCompile] = useState(false);
+  const [draftMode, setDraftMode] = useState(false);
+
   // Track the active file ID in a ref so callbacks can access current value
   const activeFileIdRef = useRef<number | null>(null);
   useEffect(() => {
     activeFileIdRef.current = activeFileId;
   }, [activeFileId]);
+
+  // Refs for compilation options (stable access from callbacks)
+  const autoCompileRef = useRef(false);
+  const draftModeRef = useRef(false);
+  useEffect(() => { autoCompileRef.current = autoCompile; }, [autoCompile]);
+  useEffect(() => { draftModeRef.current = draftMode; }, [draftMode]);
 
   // Save current active file
   const saveCurrentFile = useCallback(async (fileId: number | null, content: string) => {
@@ -89,12 +103,35 @@ export default function Editor() {
     }
   }, [projectId]);
 
+  // Auto-compile handler
+  const handleAutoCompile = useCallback(async () => {
+    setCompileError(null);
+    setSaveStatus('compiling');
+    try {
+      const data = await api.projects.compile(projectId, draftModeRef.current);
+      if (data.pdf) setPdfData(data.pdf);
+      if (data.error) setCompileError(data.error);
+    } catch (err: any) {
+      setCompileError(err.message || 'Auto-compile failed');
+    } finally {
+      setSaveStatus('saved');
+    }
+  }, [projectId]);
+
   // Auto-save handler — stable ref
   const handleAutoSave = useCallback(() => {
     if (!viewRef.current || !activeFileIdRef.current) return;
     const content = viewRef.current.state.doc.toString();
-    saveCurrentFile(activeFileIdRef.current, content);
-  }, [saveCurrentFile]);
+    saveCurrentFile(activeFileIdRef.current, content).then(() => {
+      // After save completes, trigger auto-compile if enabled
+      if (autoCompileRef.current) {
+        if (autoCompileTimerRef.current) clearTimeout(autoCompileTimerRef.current);
+        autoCompileTimerRef.current = setTimeout(() => {
+          handleAutoCompile();
+        }, AUTO_COMPILE_DELAY);
+      }
+    });
+  }, [saveCurrentFile, handleAutoCompile]);
 
   // Manual save handler — stable ref
   const handleSave = useCallback(async () => {
@@ -106,7 +143,15 @@ export default function Editor() {
     }
     const content = viewRef.current.state.doc.toString();
     await saveCurrentFile(activeFileIdRef.current, content);
-  }, [saveCurrentFile, saveStatus]);
+
+    // Trigger auto-compile if enabled after manual save
+    if (autoCompileRef.current) {
+      if (autoCompileTimerRef.current) clearTimeout(autoCompileTimerRef.current);
+      autoCompileTimerRef.current = setTimeout(() => {
+        handleAutoCompile();
+      }, AUTO_COMPILE_DELAY);
+    }
+  }, [saveCurrentFile, saveStatus, handleAutoCompile]);
 
   // Keep refs updated for use inside CodeMirror extensions
   useEffect(() => {
@@ -120,6 +165,11 @@ export default function Editor() {
   // Compile handler
   const handleCompile = useCallback(async () => {
     if (saveStatus === 'compiling') return;
+    // Clear pending auto-compile
+    if (autoCompileTimerRef.current) {
+      clearTimeout(autoCompileTimerRef.current);
+      autoCompileTimerRef.current = null;
+    }
     // Save current file first
     if (viewRef.current && activeFileId) {
       const content = viewRef.current.state.doc.toString();
@@ -133,7 +183,7 @@ export default function Editor() {
     setCompileError(null);
     setPdfData(null);
     try {
-      const data = await api.projects.compile(projectId);
+      const data = await api.projects.compile(projectId, draftMode);
       if (data.pdf) {
         setPdfData(data.pdf);
       }
@@ -145,7 +195,7 @@ export default function Editor() {
     } finally {
       setSaveStatus((prev) => prev === 'compiling' ? 'saved' : prev);
     }
-  }, [projectId, saveStatus, activeFileId, saveCurrentFile]);
+  }, [projectId, saveStatus, activeFileId, saveCurrentFile, draftMode]);
 
   // Load files list
   const loadFiles = useCallback(async () => {
@@ -196,7 +246,6 @@ export default function Editor() {
           setActiveFileId(mainTex.id);
           setActiveFileName(mainTex.name);
           setActiveImageSrc(null);
-          // Load file content
           try {
             const fileData = await api.projects.getFile(projectId, mainTex.id);
             if (!cancelled) {
@@ -206,7 +255,6 @@ export default function Editor() {
             if (!cancelled) setActiveFileContent('');
           }
         } else if (filelist.length > 0) {
-          // Select first non-folder file
           const firstFile = filelist.find((f: ProjectFile) => !f.is_folder);
           if (firstFile) {
             setActiveFileId(firstFile.id);
@@ -266,27 +314,18 @@ export default function Editor() {
       try {
         const data = await api.projects.getFile(projectId, file.id);
         const content = data.file.content || '';
-        // Determine MIME type
         const ext = file.name.toLowerCase().split('.').pop();
         const mimeMap: Record<string, string> = {
-          png: 'image/png',
-          jpg: 'image/jpeg',
-          jpeg: 'image/jpeg',
-          gif: 'image/gif',
-          bmp: 'image/bmp',
-          webp: 'image/webp',
-          svg: 'image/svg+xml',
+          png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+          gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', svg: 'image/svg+xml',
         };
         const mime = mimeMap[ext || ''] || 'image/png';
-        // Check if content is base64 (binary images) or text (SVG)
         if (ext === 'svg' && !content.startsWith('iVBOR') && content.includes('<svg')) {
-          // SVG stored as text
           setActiveImageSrc(`data:${mime};utf8,${encodeURIComponent(content)}`);
         } else {
-          // Binary image stored as base64
           setActiveImageSrc(`data:${mime};base64,${content}`);
         }
-        setActiveFileContent(''); // No editor content for images
+        setActiveFileContent('');
       } catch {
         setActiveFileContent('');
       }
@@ -309,9 +348,7 @@ export default function Editor() {
   const handleFileCreate = useCallback(async (name: string, path: string, isFolder: boolean) => {
     try {
       const data = await api.projects.createFile(projectId, name, path, isFolder);
-      // Refresh file list
       await loadFiles();
-      // If it's a file (not folder), select it
       if (!isFolder && data.file) {
         handleFileSelect({
           ...data.file,
@@ -325,6 +362,16 @@ export default function Editor() {
     }
   }, [projectId, loadFiles, handleFileSelect]);
 
+  // Handle file move (drag & drop in file explorer)
+  const handleFileMove = useCallback(async (fileId: number, newPath: string) => {
+    try {
+      await api.projects.moveFile(projectId, fileId, newPath);
+      await loadFiles();
+    } catch (err: any) {
+      alert('Failed to move file: ' + (err.message || 'Unknown error'));
+    }
+  }, [projectId, loadFiles]);
+
   // Handle file deletion
   const handleFileDelete = useCallback(async (file: ProjectFile) => {
     const confirmed = confirm(`Delete "${file.name}"? This cannot be undone.`);
@@ -332,7 +379,6 @@ export default function Editor() {
 
     try {
       await api.projects.deleteFile(projectId, file.id);
-      // If deleting active file, clear it
       if (file.id === activeFileId) {
         setActiveFileId(null);
         setActiveFileContent('');
@@ -350,6 +396,16 @@ export default function Editor() {
     fileInputRef.current?.click();
   }, []);
 
+  // Handle file upload to specific folder
+  const handleFileUploadToFolder = useCallback(async (folder: string, fileList: FileList) => {
+    try {
+      await api.projects.uploadFiles(projectId, Array.from(fileList), folder);
+      await loadFiles();
+    } catch (err: any) {
+      alert('Upload failed: ' + (err.message || 'Unknown error'));
+    }
+  }, [projectId, loadFiles]);
+
   const onFilesSelected = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = e.target.files;
     if (!selectedFiles || selectedFiles.length === 0) return;
@@ -361,22 +417,17 @@ export default function Editor() {
       alert('Upload failed: ' + (err.message || 'Unknown error'));
     }
 
-    // Reset input
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   }, [projectId, loadFiles]);
 
-  // Initialize CodeMirror ONCE when the editor div and file content are ready.
-  // Use refs for callbacks to avoid re-creating the editor on function identity changes.
-  // Only re-create when the active file changes (fileId or content change from switching).
+  // Initialize CodeMirror
   useEffect(() => {
     if (loading || !editorRef.current) return;
     if (!activeFileId && activeFileContent === '' && files.length > 0) return;
-    // Don't create editor for image files
     if (isImageFile(activeFileName)) return;
 
-    // Destroy existing view
     if (viewRef.current) {
       viewRef.current.destroy();
       viewRef.current = null;
@@ -442,9 +493,7 @@ export default function Editor() {
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             setSaveStatus('unsaved');
-            // Clear existing auto-save timer
             if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
-            // Set new auto-save timer
             autoSaveTimerRef.current = setTimeout(() => {
               autoSaveCallbackRef.current();
             }, AUTO_SAVE_DELAY);
@@ -474,17 +523,13 @@ export default function Editor() {
         autoSaveTimerRef.current = null;
       }
     };
-    // ONLY depend on activeFileId and activeFileContent — the fileId+content pair
-    // changes only when switching files. NOT on handleSave/handleAutoSave which would
-    // destroy/recreate the editor on every keystroke cycle.
   }, [loading, activeFileId, activeFileContent, projectId]);
 
-  // Cleanup auto-save timer on unmount
+  // Cleanup timers on unmount
   useEffect(() => {
     return () => {
-      if (autoSaveTimerRef.current) {
-        clearTimeout(autoSaveTimerRef.current);
-      }
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+      if (autoCompileTimerRef.current) clearTimeout(autoCompileTimerRef.current);
     };
   }, []);
 
@@ -577,6 +622,34 @@ export default function Editor() {
             )}
           </div>
 
+          {/* Auto-compile toggle */}
+          <button
+            onClick={() => setAutoCompile(prev => !prev)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+              autoCompile
+                ? 'border-purple-200 bg-purple-50 text-purple-700 dark:border-purple-800 dark:bg-purple-950 dark:text-purple-300'
+                : 'border-gray-200 bg-white text-gray-500 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700'
+            }`}
+            title={autoCompile ? 'Auto-compile ON: PDF regenerates after each save' : 'Auto-compile OFF: Click Compile manually'}
+          >
+            <Zap className={`h-3 w-3 ${autoCompile ? 'text-purple-500' : ''}`} />
+            Auto
+          </button>
+
+          {/* Draft mode toggle */}
+          <button
+            onClick={() => setDraftMode(prev => !prev)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+              draftMode
+                ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                : 'border-gray-200 bg-white text-gray-500 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700'
+            }`}
+            title={draftMode ? 'Draft mode ON: Skips images, faster compilation' : 'Draft mode OFF: Full compilation'}
+          >
+            <PencilLine className={`h-3 w-3 ${draftMode ? 'text-amber-500' : ''}`} />
+            Draft
+          </button>
+
           {!isViewingImage && (
             <button
               onClick={handleSave}
@@ -617,6 +690,14 @@ export default function Editor() {
         </div>
       )}
 
+      {/* Draft mode indicator */}
+      {draftMode && (
+        <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-1.5 dark:border-amber-800 dark:bg-amber-950">
+          <PencilLine className="h-3.5 w-3.5 text-amber-500" />
+          <span className="text-xs text-amber-700 dark:text-amber-300">Draft mode — images skipped, faster compilation</span>
+        </div>
+      )}
+
       {/* Loading state */}
       {loading && (
         <div className="flex flex-1 items-center justify-center">
@@ -637,6 +718,8 @@ export default function Editor() {
                 onFileCreate={handleFileCreate}
                 onFileDelete={handleFileDelete}
                 onFileUpload={handleFileUpload}
+                onFileMove={handleFileMove}
+                onFileUploadToFolder={handleFileUploadToFolder}
                 loading={filesLoading}
               />
             </div>
@@ -684,7 +767,7 @@ export default function Editor() {
                 </div>
                 <p className="text-sm font-medium text-gray-500 dark:text-gray-400">No PDF preview</p>
                 <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-                  Click "Compile" to generate a PDF
+                  {autoCompile ? 'PDF will auto-generate on save' : 'Click "Compile" to generate a PDF'}
                 </p>
               </div>
             )}

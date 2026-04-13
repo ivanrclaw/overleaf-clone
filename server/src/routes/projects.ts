@@ -284,6 +284,80 @@ export function createProjectRouter(upload: multer.Multer): Router {
     res.json({ file: updated });
   });
 
+  // PATCH /api/projects/:id/files/:fileId/move — move/rename a file
+  router.patch('/:id/files/:fileId/move', (req, res: Response): void => {
+    const user = getUser(req);
+    const project = getProjectForUser(req.params.id, user.id);
+    if (!project) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+
+    const file = db
+      .prepare('SELECT id, name, path, is_folder FROM project_files WHERE id = ? AND project_id = ?')
+      .get(req.params.fileId, req.params.id) as any;
+    if (!file) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    const { newPath } = req.body;
+    if (!newPath || typeof newPath !== 'string' || !newPath.startsWith('/')) {
+      res.status(400).json({ error: 'newPath must start with /' });
+      return;
+    }
+
+    // Normalize
+    let normalizedNewPath = newPath.endsWith('/') && newPath.length > 1
+      ? newPath.slice(0, -1)
+      : newPath;
+
+    // Check for duplicate at destination
+    const existing = db
+      .prepare('SELECT id FROM project_files WHERE project_id = ? AND path = ? AND id != ?')
+      .get(req.params.id, normalizedNewPath, req.params.fileId);
+    if (existing) {
+      res.status(409).json({ error: 'A file or folder already exists at the destination path' });
+      return;
+    }
+
+    const oldPath = file.path as string;
+    const newName = normalizedNewPath.split('/').pop() || file.name;
+
+    // Ensure parent folders at destination exist
+    ensureParentFolders(Number(req.params.id), normalizedNewPath);
+
+    if (file.is_folder) {
+      // Move the folder and all children (path prefix)
+      const folderPrefix = oldPath + '/';
+      const children = db
+        .prepare('SELECT id, path FROM project_files WHERE project_id = ? AND path LIKE ?')
+        .all(req.params.id, folderPrefix + '%') as any[];
+
+      const transaction = db.transaction(() => {
+        // Move the folder itself
+        db.prepare('UPDATE project_files SET name = ?, path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(newName, normalizedNewPath, file.id);
+
+        // Move all children: replace old prefix with new prefix
+        for (const child of children) {
+          const childNewPath = normalizedNewPath + child.path.substring(oldPath.length);
+          const childNewName = childNewPath.split('/').pop()!;
+          db.prepare('UPDATE project_files SET name = ?, path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+            .run(childNewName, childNewPath, child.id);
+        }
+      });
+      transaction();
+    } else {
+      // Just move the file
+      db.prepare('UPDATE project_files SET name = ?, path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(newName, normalizedNewPath, file.id);
+    }
+
+    const updated = db.prepare('SELECT id, name, path, is_folder, created_at, updated_at FROM project_files WHERE id = ?').get(req.params.fileId);
+    res.json({ file: updated });
+  });
+
   // DELETE /api/projects/:id/files/:fileId — delete file or folder
   router.delete('/:id/files/:fileId', (req, res: Response): void => {
     const user = getUser(req);
@@ -395,6 +469,9 @@ export function createProjectRouter(upload: multer.Multer): Router {
       return;
     }
 
+    // Draft mode: skip images, use simplified rendering
+    const draft = req.body.draft === true || req.query.draft === '1';
+
     // Get all files for the project
     const files = db
       .prepare('SELECT path, content, is_folder FROM project_files WHERE project_id = ?')
@@ -425,7 +502,22 @@ export function createProjectRouter(upload: multer.Multer): Router {
           // Write binary content from base64
           fs.writeFileSync(absPath, Buffer.from(file.content, 'base64'));
         } else {
-          fs.writeFileSync(absPath, file.content);
+          // In draft mode, modify .tex files to use draft options
+          if (draft && (file.path.endsWith('.tex') || file.path === '/main.tex')) {
+            let texContent = file.content;
+            // Add draft option to \documentclass if not already present
+            texContent = texContent.replace(
+              /\\documentclass(\[([^\]]*)\])?/g,
+              (match: string, _bracket: string | undefined, options: string | undefined) => {
+                if (options && options.includes('draft')) return match;
+                if (options) return `\\documentclass[${options},draft]`;
+                return `\\documentclass[draft]`;
+              }
+            );
+            fs.writeFileSync(absPath, texContent);
+          } else {
+            fs.writeFileSync(absPath, file.content);
+          }
         }
       }
 
@@ -445,9 +537,14 @@ export function createProjectRouter(upload: multer.Multer): Router {
         await execFileAsync('which', ['pdflatex'], { timeout: 5000 });
         compileCmd = 'pdflatex';
         compileArgs = ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
+        if (draft) {
+          // pdflatex draft mode: don't fail on missing images
+          compileArgs = ['-draftmode', '-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
+        }
       } catch {
         compileCmd = 'tectonic';
         compileArgs = [texFile];
+        // Tectonic doesn't have a separate draft mode, but the documentclass draft option handles it
       }
 
       const { stderr } = await execFileAsync(compileCmd, compileArgs, {
