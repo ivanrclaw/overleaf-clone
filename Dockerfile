@@ -1,11 +1,5 @@
 FROM node:20-bookworm AS builder
 
-# Install LaTeX tools
-RUN apt-get update && apt-get install -y \
-    tectonic \
-    chktex \
-    && rm -rf /var/lib/apt/lists/*
-
 # Build client
 WORKDIR /app/client
 COPY client/package.json client/package-lock.json ./
@@ -23,11 +17,17 @@ RUN npm run build
 # Production image
 FROM node:20-bookworm-slim
 
-# Install LaTeX tools in production
+# Install chktex from Debian repos + curl for tectonic
 RUN apt-get update && apt-get install -y \
-    tectonic \
     chktex \
+    ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install tectonic 0.16.8 from GitHub release
+RUN curl -L https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.16.8/tectonic-0.16.8-x86_64-unknown-linux-gnu.tar.gz \
+    | tar xz -C /usr/local/bin/ \
+    && tectonic --version
 
 WORKDIR /app
 
