@@ -133,7 +133,19 @@ router.post('/:id/compile', async (req, res: Response): Promise<void> => {
   try {
     fs.writeFileSync(texFile, project.content);
 
-    await execFileAsync('tectonic', [texFile], {
+    // Try pdflatex first (TeX Live), fall back to tectonic
+    let compileCmd: string;
+    let compileArgs: string[];
+    try {
+      await execFileAsync('which', ['pdflatex'], { timeout: 5000 });
+      compileCmd = 'pdflatex';
+      compileArgs = ['-interaction=nonstopmode', '-halt-on-error', '-output-directory', tmpDir, texFile];
+    } catch {
+      compileCmd = 'tectonic';
+      compileArgs = [texFile];
+    }
+
+    const { stderr } = await execFileAsync(compileCmd, compileArgs, {
       cwd: tmpDir,
       timeout: 30000,
     });
