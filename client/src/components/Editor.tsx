@@ -23,10 +23,20 @@ import {
   FileText,
   PanelLeftClose,
   PanelLeftOpen,
+  ImageIcon,
 } from 'lucide-react';
 
 type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'compiling';
 const AUTO_SAVE_DELAY = 3000; // 3 seconds
+
+// Image extensions that should be previewed instead of edited
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg']);
+
+function isImageFile(filename: string): boolean {
+  const ext = filename.toLowerCase().split('.').pop();
+  if (!ext) return false;
+  return IMAGE_EXTENSIONS.has('.' + ext);
+}
 
 export default function Editor() {
   const { id } = useParams<{ id: string }>();
@@ -37,6 +47,10 @@ export default function Editor() {
   const viewRef = useRef<EditorView | null>(null);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Refs for stable callbacks inside CodeMirror extensions
+  const saveCallbackRef = useRef<() => void>(() => {});
+  const autoSaveCallbackRef = useRef<() => void>(() => {});
 
   const [projectName, setProjectName] = useState('');
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
@@ -52,7 +66,9 @@ export default function Editor() {
   const [activeFileName, setActiveFileName] = useState<string>('');
   const [filesLoading, setFilesLoading] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [switchingFile, setSwitchingFile] = useState(false);
+
+  // Image preview state
+  const [activeImageSrc, setActiveImageSrc] = useState<string | null>(null);
 
   // Track the active file ID in a ref so callbacks can access current value
   const activeFileIdRef = useRef<number | null>(null);
@@ -73,24 +89,33 @@ export default function Editor() {
     }
   }, [projectId]);
 
-  // Auto-save handler
+  // Auto-save handler — stable ref
   const handleAutoSave = useCallback(() => {
     if (!viewRef.current || !activeFileIdRef.current) return;
     const content = viewRef.current.state.doc.toString();
     saveCurrentFile(activeFileIdRef.current, content);
   }, [saveCurrentFile]);
 
-  // Manual save handler
+  // Manual save handler — stable ref
   const handleSave = useCallback(async () => {
-    if (!viewRef.current || !activeFileId || saveStatus === 'saving') return;
+    if (!viewRef.current || !activeFileIdRef.current || saveStatus === 'saving') return;
     // Clear any pending auto-save timer
     if (autoSaveTimerRef.current) {
       clearTimeout(autoSaveTimerRef.current);
       autoSaveTimerRef.current = null;
     }
     const content = viewRef.current.state.doc.toString();
-    await saveCurrentFile(activeFileId, content);
-  }, [activeFileId, saveStatus, saveCurrentFile]);
+    await saveCurrentFile(activeFileIdRef.current, content);
+  }, [saveCurrentFile, saveStatus]);
+
+  // Keep refs updated for use inside CodeMirror extensions
+  useEffect(() => {
+    saveCallbackRef.current = handleSave;
+  }, [handleSave]);
+
+  useEffect(() => {
+    autoSaveCallbackRef.current = handleAutoSave;
+  }, [handleAutoSave]);
 
   // Compile handler
   const handleCompile = useCallback(async () => {
@@ -170,6 +195,7 @@ export default function Editor() {
         if (mainTex) {
           setActiveFileId(mainTex.id);
           setActiveFileName(mainTex.name);
+          setActiveImageSrc(null);
           // Load file content
           try {
             const fileData = await api.projects.getFile(projectId, mainTex.id);
@@ -185,6 +211,7 @@ export default function Editor() {
           if (firstFile) {
             setActiveFileId(firstFile.id);
             setActiveFileName(firstFile.name);
+            setActiveImageSrc(null);
             try {
               const fileData = await api.projects.getFile(projectId, firstFile.id);
               if (!cancelled) {
@@ -230,17 +257,50 @@ export default function Editor() {
       autoSaveTimerRef.current = null;
     }
 
-    setSwitchingFile(true);
     setActiveFileId(file.id);
     setActiveFileName(file.name);
+    setActiveImageSrc(null);
 
+    // If it's an image file, load base64 content and show preview
+    if (isImageFile(file.name)) {
+      try {
+        const data = await api.projects.getFile(projectId, file.id);
+        const content = data.file.content || '';
+        // Determine MIME type
+        const ext = file.name.toLowerCase().split('.').pop();
+        const mimeMap: Record<string, string> = {
+          png: 'image/png',
+          jpg: 'image/jpeg',
+          jpeg: 'image/jpeg',
+          gif: 'image/gif',
+          bmp: 'image/bmp',
+          webp: 'image/webp',
+          svg: 'image/svg+xml',
+        };
+        const mime = mimeMap[ext || ''] || 'image/png';
+        // Check if content is base64 (binary images) or text (SVG)
+        if (ext === 'svg' && !content.startsWith('iVBOR') && content.includes('<svg')) {
+          // SVG stored as text
+          setActiveImageSrc(`data:${mime};utf8,${encodeURIComponent(content)}`);
+        } else {
+          // Binary image stored as base64
+          setActiveImageSrc(`data:${mime};base64,${content}`);
+        }
+        setActiveFileContent(''); // No editor content for images
+      } catch {
+        setActiveFileContent('');
+      }
+      setSaveStatus('saved');
+      return;
+    }
+
+    // Regular text file
     try {
       const data = await api.projects.getFile(projectId, file.id);
       setActiveFileContent(data.file.content || '');
     } catch {
       setActiveFileContent('');
     } finally {
-      setSwitchingFile(false);
       setSaveStatus('saved');
     }
   }, [activeFileId, projectId]);
@@ -277,6 +337,7 @@ export default function Editor() {
         setActiveFileId(null);
         setActiveFileContent('');
         setActiveFileName('');
+        setActiveImageSrc(null);
       }
       await loadFiles();
     } catch (err: any) {
@@ -306,10 +367,14 @@ export default function Editor() {
     }
   }, [projectId, loadFiles]);
 
-  // Initialize / re-initialize CodeMirror when active file changes
+  // Initialize CodeMirror ONCE when the editor div and file content are ready.
+  // Use refs for callbacks to avoid re-creating the editor on function identity changes.
+  // Only re-create when the active file changes (fileId or content change from switching).
   useEffect(() => {
-    if (loading || switchingFile || !editorRef.current) return;
+    if (loading || !editorRef.current) return;
     if (!activeFileId && activeFileContent === '' && files.length > 0) return;
+    // Don't create editor for image files
+    if (isImageFile(activeFileName)) return;
 
     // Destroy existing view
     if (viewRef.current) {
@@ -317,13 +382,11 @@ export default function Editor() {
       viewRef.current = null;
     }
 
-    const currentActiveId = activeFileId;
-
     const saveKeymap = keymap.of([
       {
         key: 'Mod-s',
         run: () => {
-          handleSave();
+          saveCallbackRef.current();
           return true;
         },
       },
@@ -383,7 +446,7 @@ export default function Editor() {
             if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
             // Set new auto-save timer
             autoSaveTimerRef.current = setTimeout(() => {
-              handleAutoSave();
+              autoSaveCallbackRef.current();
             }, AUTO_SAVE_DELAY);
           }
         }),
@@ -411,7 +474,10 @@ export default function Editor() {
         autoSaveTimerRef.current = null;
       }
     };
-  }, [loading, switchingFile, activeFileId, activeFileContent, projectId, handleSave, handleAutoSave]);
+    // ONLY depend on activeFileId and activeFileContent — the fileId+content pair
+    // changes only when switching files. NOT on handleSave/handleAutoSave which would
+    // destroy/recreate the editor on every keystroke cycle.
+  }, [loading, activeFileId, activeFileContent, projectId]);
 
   // Cleanup auto-save timer on unmount
   useEffect(() => {
@@ -438,6 +504,8 @@ export default function Editor() {
       </div>
     );
   }
+
+  const isViewingImage = activeImageSrc !== null;
 
   return (
     <div className="flex h-[calc(100vh-4rem)] flex-col bg-gray-100 dark:bg-gray-900">
@@ -509,14 +577,16 @@ export default function Editor() {
             )}
           </div>
 
-          <button
-            onClick={handleSave}
-            disabled={saveStatus === 'saving' || !activeFileId}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
-          >
-            <Save className="h-3.5 w-3.5" />
-            Save
-          </button>
+          {!isViewingImage && (
+            <button
+              onClick={handleSave}
+              disabled={saveStatus === 'saving' || !activeFileId}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+            >
+              <Save className="h-3.5 w-3.5" />
+              Save
+            </button>
+          )}
           <button
             onClick={handleCompile}
             disabled={saveStatus === 'compiling'}
@@ -572,12 +642,28 @@ export default function Editor() {
             </div>
           )}
 
-          {/* CodeMirror Editor */}
-          <div className="flex-1 border-r border-gray-200 dark:border-gray-800" ref={editorRef}>
-            {!activeFileId && (
-              <div className="flex h-full flex-col items-center justify-center text-gray-400 dark:text-gray-600">
-                <FileText className="mb-2 h-10 w-10" />
-                <p className="text-sm">Select a file to edit</p>
+          {/* CodeMirror Editor OR Image Preview */}
+          <div className="flex-1 border-r border-gray-200 dark:border-gray-800">
+            {isViewingImage ? (
+              <div className="flex h-full flex-col items-center justify-center bg-gray-950 p-4">
+                <img
+                  src={activeImageSrc}
+                  alt={activeFileName}
+                  className="max-h-full max-w-full rounded border border-gray-700 object-contain shadow-lg"
+                />
+                <p className="mt-3 flex items-center gap-1.5 text-xs text-gray-400">
+                  <ImageIcon className="h-3.5 w-3.5" />
+                  {activeFileName}
+                </p>
+              </div>
+            ) : (
+              <div className="h-full" ref={editorRef}>
+                {!activeFileId && (
+                  <div className="flex h-full flex-col items-center justify-center text-gray-400 dark:text-gray-600">
+                    <FileText className="mb-2 h-10 w-10" />
+                    <p className="text-sm">Select a file to edit</p>
+                  </div>
+                )}
               </div>
             )}
           </div>

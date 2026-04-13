@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ProjectFile } from '@/types';
-import { ChevronRight, ChevronDown, FileText, Folder, FolderOpen, Upload, Trash2, FilePlus, FolderPlus } from 'lucide-react';
+import { ChevronRight, ChevronDown, FileText, Folder, FolderOpen, Upload, Trash2, FilePlus, FolderPlus, ImageIcon } from 'lucide-react';
 
 interface FileExplorerProps {
   files: ProjectFile[];
@@ -19,6 +19,15 @@ interface TreeNode {
   file?: ProjectFile;
   children: TreeNode[];
   isFolder: boolean;
+}
+
+// Image extensions
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg']);
+
+function isImageFile(filename: string): boolean {
+  const ext = filename.toLowerCase().split('.').pop();
+  if (!ext) return false;
+  return IMAGE_EXTENSIONS.has('.' + ext);
 }
 
 function buildTree(files: ProjectFile[]): TreeNode[] {
@@ -89,6 +98,22 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
     setNewItemName('');
   };
 
+  const renderNewFileInput = (depth: number) => (
+    <div className="flex items-center gap-1 px-2 py-1" style={{ paddingLeft: `${depth * 16 + 8}px` }}>
+      <input
+        type="text"
+        value={newItemName}
+        onChange={e => setNewItemName(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter') handleCreate(); if (e.key === 'Escape') { setShowNewFile(null); setNewItemName(''); } }}
+        placeholder={showNewFile?.type === 'folder' ? 'folder name' : 'file name'}
+        className="w-28 rounded border border-gray-300 bg-white px-1.5 py-0.5 text-xs focus:border-brand-400 focus:outline-none dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+        autoFocus
+      />
+      <button onClick={handleCreate} className="text-xs text-brand-600 hover:text-brand-700 dark:text-brand-400">✓</button>
+      <button onClick={() => { setShowNewFile(null); setNewItemName(''); }} className="text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">✕</button>
+    </div>
+  );
+
   const renderNode = (node: TreeNode, depth: number = 0): React.ReactNode => {
     const isExpanded = expandedFolders.has(node.path);
     const isActive = node.file ? node.file.id === activeFileId : false;
@@ -105,24 +130,9 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
             {isExpanded ? <FolderOpen className="h-4 w-4 flex-shrink-0 text-amber-500" /> : <Folder className="h-4 w-4 flex-shrink-0 text-amber-500" />}
             <span className="truncate">{node.name}</span>
           </button>
-          {/* Add file/folder buttons inside expanded folder */}
           {isExpanded && (
             <>
-              {showNewFile && showNewFile.parentPath === node.path && (
-                <div className="flex items-center gap-1 px-2 py-1" style={{ paddingLeft: `${(depth + 1) * 16 + 8}px` }}>
-                  <input
-                    type="text"
-                    value={newItemName}
-                    onChange={e => setNewItemName(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') handleCreate(); if (e.key === 'Escape') { setShowNewFile(null); setNewItemName(''); } }}
-                    placeholder={showNewFile.type === 'folder' ? 'folder name' : 'file name'}
-                    className="w-24 rounded border border-gray-300 bg-white px-1 py-0.5 text-xs dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-                    autoFocus
-                  />
-                  <button onClick={handleCreate} className="text-xs text-brand-600 hover:text-brand-700 dark:text-brand-400">✓</button>
-                  <button onClick={() => { setShowNewFile(null); setNewItemName(''); }} className="text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">✕</button>
-                </div>
-              )}
+              {showNewFile && showNewFile.parentPath === node.path && renderNewFileInput(depth + 1)}
               {node.children.map(child => renderNode(child, depth + 1))}
             </>
           )}
@@ -131,6 +141,7 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
     }
 
     // File node
+    const isImage = isImageFile(node.name);
     return (
       <div
         key={node.path}
@@ -141,7 +152,11 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
           className="flex flex-1 items-center gap-1 truncate"
           onClick={() => node.file && onFileSelect(node.file)}
         >
-          <FileText className="h-4 w-4 flex-shrink-0 text-brand-500" />
+          {isImage ? (
+            <ImageIcon className="h-4 w-4 flex-shrink-0 text-emerald-500" />
+          ) : (
+            <FileText className="h-4 w-4 flex-shrink-0 text-brand-500" />
+          )}
           <span className="truncate">{node.name}</span>
         </button>
         <button
@@ -190,7 +205,11 @@ export default function FileExplorer({ files, activeFileId, onFileSelect, onFile
         ) : files.length === 0 ? (
           <div className="px-3 py-8 text-center text-xs text-gray-400 dark:text-gray-500">No files yet</div>
         ) : (
-          tree.map(node => renderNode(node))
+          <>
+            {/* Root-level new file/folder input */}
+            {showNewFile && showNewFile.parentPath === '/' && renderNewFileInput(0)}
+            {tree.map(node => renderNode(node))}
+          </>
         )}
       </div>
     </div>
